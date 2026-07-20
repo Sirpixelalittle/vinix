@@ -52,11 +52,17 @@ fn (mut this FramebufferNode) read(handle voidptr, buf voidptr, loc u64, count u
 		return i64(0)
 	}
 
-	vmem := &u8(this.info.base)
-	mut actual_count := count
+	size := u64(this.info.size)
+	if loc >= size {
+		return i64(0)
+	}
 
-	if loc + count > this.info.size {
-		actual_count = count - ((loc + count) - this.info.size)
+	vmem := &u8(this.info.base)
+
+	// Clamp to the framebuffer bounds without overflowing loc + count.
+	mut actual_count := count
+	if actual_count > size - loc {
+		actual_count = size - loc
 	}
 
 	unsafe { C.memcpy(buf, &vmem[loc], actual_count) }
@@ -69,11 +75,17 @@ fn (mut this FramebufferNode) write(handle voidptr, buf voidptr, loc u64, count 
 		return i64(0)
 	}
 
-	vmem := &u8(this.info.base)
-	mut actual_count := count
+	size := u64(this.info.size)
+	if loc >= size {
+		return i64(0)
+	}
 
-	if loc + count > this.info.size {
-		actual_count = count - ((loc + count) - this.info.size)
+	vmem := &u8(this.info.base)
+
+	// Clamp to the framebuffer bounds without overflowing loc + count.
+	mut actual_count := count
+	if actual_count > size - loc {
+		actual_count = size - loc
 	}
 
 	unsafe { C.memcpy(&vmem[loc], buf, actual_count) }

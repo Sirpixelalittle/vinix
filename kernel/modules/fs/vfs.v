@@ -9,6 +9,7 @@ import file
 import errno
 
 pub const at_fdcwd = -100
+pub const name_max = 255
 pub const at_empty_path = 0x1000
 pub const at_symlink_follow = 0x400
 pub const at_symlink_nofollow = 0x100
@@ -399,6 +400,13 @@ pub fn create(parent &VFSNode, name string, mode u32) ?&VFSNode {
 
 pub fn internal_create(parent &VFSNode, name string, mode u32) ?&VFSNode {
 	mut parent_of_tgt_node, mut target_node, basename := path2node(parent, name)
+
+	// Reject overly long final path components. The directory-entry name
+	// buffer is fixed-size, so unbounded names would overflow it on readdir.
+	if basename.len > name_max {
+		errno.set(errno.enametoolong)
+		return none
+	}
 
 	if unsafe { target_node != 0 } {
 		errno.set(errno.eexist)
@@ -942,7 +950,14 @@ pub fn syscall_readdir(_ voidptr, fdnum int, mut buf stat.Dirent) (u64, u64) {
 				reclen: u16(sizeof(stat.Dirent))
 				@type:  u8(t)
 			}
-			C.strcpy(&new_dirent.name[0], name.str)
+			mut namelen := u64(name.len)
+			if namelen > u64(sizeof(new_dirent.name)) - 1 {
+				namelen = u64(sizeof(new_dirent.name)) - 1
+			}
+			unsafe {
+				C.memcpy(&new_dirent.name[0], name.str, namelen)
+				new_dirent.name[namelen] = 0
+			}
 			dir_handle.dirlist << new_dirent
 		}
 		dir_handle.dirlist_valid = true

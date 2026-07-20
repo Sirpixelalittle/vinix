@@ -47,27 +47,55 @@ fn (mut this TmpFSResource) mmap(page u64, flags int) voidptr {
 
 fn (mut this TmpFSResource) read(handle voidptr, buf voidptr, loc u64, count u64) ?i64 {
 	this.l.acquire()
+	defer {
+		this.l.release()
+	}
 
+	size := u64(this.stat.size)
+
+	// Reads starting at or beyond EOF return 0 bytes.
+	if loc >= size {
+		return i64(0)
+	}
+
+	// Clamp to the bytes actually available. Computing `size - loc` only after
+	// the `loc >= size` guard avoids the u64 underflow/overflow that a crafted
+	// loc/count pair (e.g. count near 2^64) would otherwise trigger.
 	mut actual_count := count
-
-	if loc + count > this.stat.size {
-		actual_count = u64(count - ((loc + count) - this.stat.size))
+	if actual_count > size - loc {
+		actual_count = size - loc
 	}
 
 	unsafe { C.memcpy(buf, &this.storage[loc], actual_count) }
-
-	this.l.release()
 
 	return i64(actual_count)
 }
 
 fn (mut this TmpFSResource) write(handle voidptr, buf voidptr, loc u64, count u64) ?i64 {
 	this.l.acquire()
+	defer {
+		this.l.release()
+	}
 
-	if loc + count > this.capacity {
-		mut new_capacity := this.capacity
+	// Reject requests whose end offset would overflow u64. Without this, the
+	// wrapped value bypasses the capacity check below and leads to an
+	// out-of-bounds memcpy into the storage buffer.
+	if loc + count < loc {
+		return none
+	}
 
-		for loc + count > new_capacity {
+	end := loc + count
+
+	if end > this.capacity {
+		mut new_capacity := if this.capacity == 0 { u64(1) } else { this.capacity }
+
+		for new_capacity < end {
+			// Stop doubling before it overflows to 0 and loops forever; jump
+			// straight to the needed size instead.
+			if new_capacity > (~u64(0)) / 2 {
+				new_capacity = end
+				break
+			}
 			new_capacity *= 2
 		}
 
@@ -83,12 +111,10 @@ fn (mut this TmpFSResource) write(handle voidptr, buf voidptr, loc u64, count u6
 
 	unsafe { C.memcpy(&this.storage[loc], buf, count) }
 
-	if loc + count > this.stat.size {
-		this.stat.size = loc + count
+	if end > u64(this.stat.size) {
+		this.stat.size = i64(end)
 		this.stat.blocks = lib.div_roundup(this.stat.size, this.stat.blksize)
 	}
-
-	this.l.release()
 
 	return i64(count)
 }

@@ -316,6 +316,14 @@ fn (mut this UnixSocket) connect(handle voidptr, _addr voidptr, addrlen u32) ? {
 		return none
 	}
 
+	// Validate the caller-supplied address length before deriving a copy size
+	// from it below. An unchecked addrlen lets name_len exceed the fixed-size
+	// abstract-socket name buffers, causing out-of-bounds access.
+	if addrlen < u32(sizeof(u16)) || addrlen > u32(sizeof(SockaddrUn)) {
+		errno.set(errno.einval)
+		return none
+	}
+
 	mut socket := &UnixSocket(unsafe { nil })
 
 	// Abstract socket: sun_path[0] == '\0'
@@ -383,6 +391,14 @@ fn (mut this UnixSocket) bind(handle voidptr, _addr voidptr, addrlen u32) ? {
 	addr := unsafe { &SockaddrUn(_addr) }
 
 	if addr.sun_family != sock_pub.af_unix {
+		errno.set(errno.einval)
+		return none
+	}
+
+	// Validate the caller-supplied address length before deriving a copy size
+	// from it below. An unchecked addrlen lets name_len exceed the fixed-size
+	// abstract-socket name buffers, causing an out-of-bounds write.
+	if addrlen < u32(sizeof(u16)) || addrlen > u32(sizeof(SockaddrUn)) {
 		errno.set(errno.einval)
 		return none
 	}
