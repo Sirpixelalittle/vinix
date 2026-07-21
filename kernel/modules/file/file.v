@@ -22,6 +22,8 @@ pub const f_setlk = 6
 pub const f_setlkw = 7
 pub const f_getown = 8
 pub const f_setown = 9
+pub const f_setpipe_sz = 1031
+pub const f_getpipe_sz = 1032
 
 pub const fd_cloexec = 1
 
@@ -425,6 +427,30 @@ pub fn syscall_fcntl(_ voidptr, fdnum int, cmd int, arg u64) (u64, u64) {
 		}
 		f_setfl {
 			handle.flags = int(arg)
+			fd.unref()
+		}
+		f_getpipe_sz {
+			if handle.resource.stat.mode & stat.ifmt != stat.ifpipe {
+				fd.unref()
+				return errno.err, errno.einval
+			}
+			ret = u64(handle.resource.stat.size)
+			fd.unref()
+		}
+		f_setpipe_sz {
+			if handle.resource.stat.mode & stat.ifmt != stat.ifpipe {
+				fd.unref()
+				return errno.err, errno.einval
+			}
+			mut new_size := arg
+			if new_size < 4096 {
+				new_size = 4096
+			}
+			handle.resource.grow(voidptr(handle), new_size) or {
+				fd.unref()
+				return errno.err, errno.get()
+			}
+			ret = new_size
 			fd.unref()
 		}
 		else {

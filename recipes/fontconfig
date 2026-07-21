@@ -21,6 +21,9 @@ build() {
 package() {
     DESTDIR="${dest_dir}" ninja install
 
+    mkdir -p "${dest_dir}"/var/cache/fontconfig
+    chmod 0755 "${dest_dir}"/var/cache/fontconfig
+
     rm -v "${dest_dir}${prefix}"/lib/*.a
 
     post_package_strip

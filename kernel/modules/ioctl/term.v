@@ -10,6 +10,10 @@ pub const tcsetsf = 0x5404
 
 pub const tiocsctty = 0x540e
 
+pub const tiocgpgrp = 0x540f
+
+pub const tiocspgrp = 0x5410
+
 pub const tiocgwinsz = 0x5413
 
 pub struct WinSize {

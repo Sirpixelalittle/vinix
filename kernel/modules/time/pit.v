@@ -44,8 +44,10 @@ pub fn pit_initialise() {
 }
 
 fn C.x86__apic__lapic_eoi()
+fn C.userland__tick_itimers()
 
 fn pit_handler(num u32, gpr_state &cpulocal.GPRState) {
 	timer_handler()
+	C.userland__tick_itimers()
 	C.x86__apic__lapic_eoi()
 }

@@ -37,6 +37,7 @@ pub fn create() ?&Pipe {
 		capacity: pipe_buf
 	}
 	p.stat.mode = stat.ifpipe
+	p.stat.size = pipe_buf
 
 	return p
 }
@@ -219,6 +220,49 @@ fn (mut this Pipe) link(handle voidptr) ? {
 	katomic.inc(mut &this.stat.nlink)
 }
 
-fn (mut this Pipe) grow(handle voidptr, new_size u64) ? {
-	return none
+fn (mut this Pipe) grow(_ voidptr, new_size u64) ? {
+	this.l.acquire()
+	defer {
+		this.l.release()
+	}
+	if new_size < this.used {
+		errno.set(errno.ebusy)
+		return none
+	}
+	if new_size == this.capacity {
+		return
+	}
+
+	mut new_data := unsafe { &u8(malloc(new_size)) }
+	if new_data == unsafe { nil } {
+		errno.set(errno.enomem)
+		return none
+	}
+
+	before_wrap := if this.read_ptr + this.used > this.capacity {
+		this.capacity - this.read_ptr
+	} else {
+		this.used
+	}
+	after_wrap := this.used - before_wrap
+	unsafe {
+		C.memcpy(new_data, &this.data[this.read_ptr], before_wrap)
+		if after_wrap > 0 {
+			C.memcpy(&new_data[before_wrap], this.data, after_wrap)
+		}
+		free(this.data)
+	}
+	this.data = new_data
+	this.capacity = new_size
+	this.read_ptr = 0
+	this.write_ptr = this.used
+	if this.write_ptr == this.capacity {
+		this.write_ptr = 0
+	}
+	this.stat.size = i64(new_size)
+	if this.used < this.capacity {
+		this.status |= file.pollout
+	} else {
+		this.status &= ~file.pollout
+	}
 }

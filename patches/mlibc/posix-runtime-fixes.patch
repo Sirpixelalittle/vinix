@@ -1,0 +1,47 @@
+--- a/sysdeps/vinix/generic/generic.cpp
++++ b/sysdeps/vinix/generic/generic.cpp
+@@ -504,3 +504,4 @@
+-	(void)pid;
+-	mlibc::infoLogger() << "mlibc: " << __func__ << " is a stub!\n" << frg::endlog;
+-	*pgid = 0;
++	__syscall_ret ret = __syscall(63, pid);
++	if (ret.errno != 0)
++		return ret.errno;
++	*pgid = (pid_t)ret.ret;
+@@ -516,2 +517,3 @@
+-	(void)pid; (void)pgid;
+-	mlibc::infoLogger() << "mlibc: " << __func__ << " is a stub!\n" << frg::endlog;
++	__syscall_ret ret = __syscall(64, pid, pgid);
++	if (ret.errno != 0)
++		return ret.errno;
+@@ -821,0 +824,5 @@
++int sys_sigsuspend(const sigset_t *set) {
++	__syscall_ret ret = __syscall(54, set);
++	return ret.errno ? ret.errno : EINTR;
++}
++
+@@ -847 +853,0 @@
+-again:
+@@ -850,5 +856 @@
+-	if (ret.errno != 0) {
+-		if (ret.errno == EINTR) {
+-			goto again;
+-		}
+-
++	if (ret.errno != 0)
+@@ -856 +857,0 @@
+-	}
+@@ -925,3 +926,3 @@
+-int sys_getitimer(int, struct itimerval *) {
+-	mlibc::infoLogger() << "mlibc: sys_getitimer() is unimplemented" << frg::endlog;
+-	return ENOSYS;
++int sys_getitimer(int which, struct itimerval *current) {
++	__syscall_ret ret = __syscall(55, which, current);
++	return ret.errno;
+@@ -930,3 +931,3 @@
+-int sys_setitimer(int, const struct itimerval *, struct itimerval *) {
+-	mlibc::infoLogger() << "mlibc: sys_setitimer() is unimplemented" << frg::endlog;
+-	return ENOSYS;
++int sys_setitimer(int which, const struct itimerval *new_value, struct itimerval *old_value) {
++	__syscall_ret ret = __syscall(56, which, new_value, old_value);
++	return ret.errno;

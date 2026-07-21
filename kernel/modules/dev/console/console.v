@@ -160,7 +160,10 @@ fn add_to_buf(ptr &u8, count u64, echo bool) {
 		c := unsafe { ptr[i] }
 		if console_termios.c_lflag & termios.isig != 0 {
 			if c == console_termios.c_cc[termios.vintr] {
-				userland.sendsig(latest_thread, userland.sigint)
+				if console_res.foreground_pgid == 0
+					|| !userland.signal_process_group(console_res.foreground_pgid, userland.sigint) {
+					userland.sendsig(latest_thread, userland.sigint)
+				}
 			}
 		}
 		add_to_buf_char(c, echo)
@@ -465,7 +468,8 @@ pub mut:
 	status   int
 	can_mmap bool
 
-	termios termios.Termios
+	termios         termios.Termios
+	foreground_pgid int
 }
 
 fn (mut this Console) mmap(page u64, flags int) voidptr {
@@ -546,6 +550,34 @@ fn (mut this Console) ioctl(handle voidptr, request u64, argp voidptr) ?int {
 	latest_thread = proc.current_thread()
 
 	match request {
+		ioctl.tiocgpgrp {
+			mut pgrp := unsafe { &int(argp) }
+			if pgrp == unsafe { nil } {
+				errno.set(errno.efault)
+				return none
+			}
+			if this.foreground_pgid == 0 {
+				this.foreground_pgid = proc.current_thread().process.pgid
+			}
+			unsafe {
+				*pgrp = this.foreground_pgid
+			}
+			return 0
+		}
+		ioctl.tiocspgrp {
+			pgrp := unsafe { &int(argp) }
+			if pgrp == unsafe { nil } || *pgrp <= 0 {
+				errno.set(errno.einval)
+				return none
+			}
+			current := proc.current_thread().process
+			if !userland.process_group_exists(*pgrp, current.sid) {
+				errno.set(errno.eperm)
+				return none
+			}
+			this.foreground_pgid = *pgrp
+			return 0
+		}
 		ioctl.tiocgwinsz {
 			mut w := unsafe { &ioctl.WinSize(argp) }
 			w.ws_row = u16(terminal_rows)

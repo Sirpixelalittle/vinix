@@ -34,6 +34,9 @@ pub mut:
 	sigactions         [256]SigAction
 	pending_signals    u64
 	masked_signals     u64
+	sigsuspend_oldmask u64
+	sigsuspend_restore bool
+	signal_event       eventstruct.Event
 	enqueued_by_signal bool
 	stacks             []voidptr
 	signalfds_lock     klock.Lock

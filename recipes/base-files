@@ -8,4 +8,10 @@ source_dir="base-files"
 
 package() {
     cp -r ${source_dir}/. "${dest_dir}"/
+
+    # POSIX requires a world-writable, sticky temporary directory. Pre-create
+    # the X11 socket directory with the same protections so Xorg does not have
+    # to create it under the caller's umask.
+    mkdir -p "${dest_dir}"/tmp/.X11-unix
+    chmod 1777 "${dest_dir}"/tmp "${dest_dir}"/tmp/.X11-unix
 }

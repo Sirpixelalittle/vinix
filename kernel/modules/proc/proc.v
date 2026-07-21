@@ -14,6 +14,8 @@ pub struct Process {
 pub mut:
 	pid                      int
 	ppid                     int
+	pgid                     int
+	sid                      int
 	pagemap                  &memory.Pagemap = unsafe { nil }
 	thread_stack_top         u64
 	threads                  []&Thread
@@ -25,6 +27,8 @@ pub mut:
 	event                    eventstruct.Event
 	status                   int
 	name                     string
+	itimer_real_value_us     i64
+	itimer_real_interval_us  i64
 }
 
 pub struct SigAction {

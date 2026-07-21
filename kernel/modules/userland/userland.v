@@ -16,6 +16,8 @@ import errno
 import lib
 import strings
 import resource
+import klock
+import time
 
 pub const wnohang = 1
 
@@ -101,6 +103,25 @@ pub const sig_dfl = voidptr(-2)
 
 pub const sig_ign = voidptr(-3)
 
+const max_itimer_real = 512
+
+struct TimeVal {
+mut:
+	tv_sec  i64
+	tv_usec i64
+}
+
+struct ITimerVal {
+mut:
+	it_interval TimeVal
+	it_value    TimeVal
+}
+
+__global (
+	itimer_real_processes [max_itimer_real]&proc.Process
+	itimer_real_lock      klock.Lock
+)
+
 pub const sa_nocldstop = 1 << 0
 
 pub const sa_onstack = 1 << 1
@@ -160,6 +181,53 @@ pub fn syscall_getppid(_ voidptr) (u64, u64) {
 	return u64(t.process.ppid), 0
 }
 
+pub fn syscall_getpgid(_ voidptr, pid int) (u64, u64) {
+	mut current := proc.current_thread().process
+	target_pid := if pid == 0 { current.pid } else { pid }
+	if target_pid < 1 || target_pid >= 65536 {
+		return errno.err, errno.esrch
+	}
+	target := processes[target_pid]
+	if target == unsafe { nil } {
+		return errno.err, errno.esrch
+	}
+	return u64(target.pgid), 0
+}
+
+pub fn syscall_setpgid(_ voidptr, pid int, pgid int) (u64, u64) {
+	mut current := proc.current_thread().process
+	target_pid := if pid == 0 { current.pid } else { pid }
+	if target_pid < 1 || target_pid >= 65536 || pgid < 0 {
+		return errno.err, errno.einval
+	}
+
+	mut target := processes[target_pid]
+	if target == unsafe { nil } || (target != current && target.ppid != current.pid) {
+		return errno.err, errno.esrch
+	}
+	if target.sid != current.sid || target.pid == target.sid {
+		return errno.err, errno.eperm
+	}
+
+	new_pgid := if pgid == 0 { target.pid } else { pgid }
+	if new_pgid != target.pid {
+		mut group_exists := false
+		for i := 1; i < 65536; i++ {
+			member := processes[i]
+			if member != unsafe { nil } && member.pgid == new_pgid && member.sid == target.sid {
+				group_exists = true
+				break
+			}
+		}
+		if !group_exists {
+			return errno.err, errno.eperm
+		}
+	}
+
+	target.pgid = new_pgid
+	return 0, 0
+}
+
 pub fn syscall_getgroups(_ voidptr, size int, list &u32) (u64, u64) {
 	mut current_thread := proc.current_thread()
 	mut process := current_thread.process
@@ -188,20 +256,19 @@ pub fn syscall_sigentry(_ voidptr, sigentry u64) (u64, u64) {
 	return 0, 0
 }
 
-@[noreturn]
-pub fn syscall_sigreturn(_ voidptr, context &cpulocal.GPRState, old_mask u64) {
+pub fn syscall_sigreturn(syscall_context &cpulocal.GPRState, context &cpulocal.GPRState, old_mask u64) (u64, u64) {
 	mut t := unsafe { proc.current_thread() }
-
-	asm volatile amd64 {
-		cli
+	if syscall_context == unsafe { nil } || context == unsafe { nil } {
+		return errno.err, errno.efault
 	}
 
-	t.gpr_state = *context
 	t.masked_signals = old_mask
-
-	sched.yield(false)
-
-	for {}
+	unsafe {
+		*syscall_context = *context
+	}
+	// syscall_entry stores these return values into the restored frame before
+	// returning to userspace, so preserve the interrupted values explicitly.
+	return syscall_context.rax, syscall_context.rdx
 }
 
 pub fn syscall_sigaction(_ voidptr, signum int, act &proc.SigAction, oldact &proc.SigAction) (u64, u64) {
@@ -214,7 +281,7 @@ pub fn syscall_sigaction(_ voidptr, signum int, act &proc.SigAction, oldact &pro
 		C.printf(c'\e[32m%s\e[m: returning\n', process.name.str)
 	}
 
-	if signum < 0 || signum > 34 || signum == sigkill || signum == sigstop {
+	if signum <= 0 || signum > sigcancel || signum == sigkill || signum == sigstop {
 		return errno.err, errno.einval
 	}
 
@@ -262,10 +329,183 @@ pub fn syscall_sigprocmask(_ voidptr, how int, set &u64, oldset &u64) (u64, u64)
 			sig_setmask {
 				t.masked_signals = *set
 			}
-			else {}
+			else {
+				return errno.err, errno.einval
+			}
+		}
+		t.masked_signals &= ~((u64(1) << sigkill) | (u64(1) << sigstop))
+	}
+
+	return 0, 0
+}
+
+// Atomically replace the signal mask and sleep until a signal allowed by the
+// temporary mask becomes pending. The original mask is restored by
+// dispatch_a_signal() as part of returning from the signal handler.
+pub fn syscall_sigsuspend(_ voidptr, set &u64) (u64, u64) {
+	if set == unsafe { nil } {
+		return errno.err, errno.efault
+	}
+
+	mut t := proc.current_thread()
+	oldmask := t.masked_signals
+	// SIGKILL and SIGSTOP cannot be blocked.
+	t.masked_signals = *set & ~((u64(1) << sigkill) | (u64(1) << sigstop))
+
+	for t.pending_signals & ~t.masked_signals == 0 {
+		mut events := [&t.signal_event]
+		event.await(mut events, true) or {}
+		unsafe { events.free() }
+	}
+
+	// Leave the temporary mask installed until signal dispatch. This is what
+	// makes sigsuspend atomic with respect to delivery of the waking signal.
+	t.sigsuspend_oldmask = oldmask
+	t.sigsuspend_restore = true
+	return errno.err, errno.eintr
+}
+
+fn valid_timeval(value TimeVal) bool {
+	return value.tv_sec >= 0 && value.tv_usec >= 0 && value.tv_usec < 1000000
+}
+
+fn timeval_to_us(value TimeVal) i64 {
+	return value.tv_sec * 1000000 + value.tv_usec
+}
+
+fn us_to_timeval(value i64) TimeVal {
+	if value <= 0 {
+		return TimeVal{}
+	}
+	return TimeVal{
+		tv_sec:  value / 1000000
+		tv_usec: value % 1000000
+	}
+}
+
+fn remove_itimer_process(process &proc.Process) {
+	for i := 0; i < max_itimer_real; i++ {
+		// V's generated equality for two pointers to a struct compares the
+		// pointed-to values. Timer slots are identities, and an empty slot must
+		// never be dereferenced, so compare the addresses explicitly.
+		if voidptr(itimer_real_processes[i]) == voidptr(process) {
+			itimer_real_processes[i] = unsafe { nil }
+		}
+	}
+}
+
+fn disarm_itimer_real(_process &proc.Process) {
+	mut process := unsafe { _process }
+	itimer_real_lock.acquire()
+	remove_itimer_process(process)
+	process.itimer_real_value_us = 0
+	process.itimer_real_interval_us = 0
+	itimer_real_lock.release()
+}
+
+// Called from the 1 kHz PIT interrupt on AMD64.
+@[markused]
+pub fn tick_itimers() {
+	if !itimer_real_lock.test_and_acquire() {
+		return
+	}
+
+	for i := 0; i < max_itimer_real; i++ {
+		mut process := itimer_real_processes[i]
+		if process == unsafe { nil } || process.itimer_real_value_us <= 0 {
+			continue
+		}
+
+		process.itimer_real_value_us -= 1000000 / i64(time.timer_frequency)
+		if process.itimer_real_value_us > 0 {
+			continue
+		}
+
+		if process.itimer_real_interval_us > 0 {
+			// Preserve elapsed time if a tick arrives slightly after expiry.
+			for process.itimer_real_value_us <= 0 {
+				process.itimer_real_value_us += process.itimer_real_interval_us
+			}
+		} else {
+			process.itimer_real_value_us = 0
+			itimer_real_processes[i] = unsafe { nil }
+		}
+
+		if process.threads.len > 0 {
+			sendsig(process.threads[0], u8(sigalrm))
 		}
 	}
 
+	itimer_real_lock.release()
+}
+
+pub fn syscall_getitimer(_ voidptr, which int, current &ITimerVal) (u64, u64) {
+	if which != 0 {
+		return errno.err, errno.einval
+	}
+	if current == unsafe { nil } {
+		return errno.err, errno.efault
+	}
+
+	mut process := proc.current_thread().process
+	itimer_real_lock.acquire()
+	unsafe {
+		current.it_value = us_to_timeval(process.itimer_real_value_us)
+		current.it_interval = us_to_timeval(process.itimer_real_interval_us)
+	}
+	itimer_real_lock.release()
+	return 0, 0
+}
+
+pub fn syscall_setitimer(_ voidptr, which int, new_value &ITimerVal, old_value &ITimerVal) (u64, u64) {
+	if which != 0 {
+		return errno.err, errno.einval
+	}
+	if new_value == unsafe { nil } {
+		return errno.err, errno.efault
+	}
+	if !valid_timeval(new_value.it_value) || !valid_timeval(new_value.it_interval) {
+		return errno.err, errno.einval
+	}
+
+	value_us := timeval_to_us(new_value.it_value)
+	interval_us := timeval_to_us(new_value.it_interval)
+	mut process := proc.current_thread().process
+
+	itimer_real_lock.acquire()
+	if old_value != unsafe { nil } {
+		unsafe {
+			old_value.it_value = us_to_timeval(process.itimer_real_value_us)
+			old_value.it_interval = us_to_timeval(process.itimer_real_interval_us)
+		}
+	}
+
+	mut slot := -1
+	mut free_slot := -1
+	for i := 0; i < max_itimer_real; i++ {
+		if voidptr(itimer_real_processes[i]) == voidptr(process) {
+			slot = i
+			break
+		}
+		if free_slot == -1 && itimer_real_processes[i] == unsafe { nil } {
+			free_slot = i
+		}
+	}
+
+	if value_us > 0 && slot == -1 {
+		if free_slot == -1 {
+			itimer_real_lock.release()
+			return errno.err, errno.eagain
+		}
+		slot = free_slot
+		itimer_real_processes[slot] = process
+	} else if value_us == 0 && slot != -1 {
+		itimer_real_processes[slot] = unsafe { nil }
+	}
+
+	process.itimer_real_value_us = value_us
+	process.itimer_real_interval_us = interval_us
+	itimer_real_lock.release()
 	return 0, 0
 }
 
@@ -296,56 +536,89 @@ pub fn dispatch_a_signal(context &cpulocal.GPRState) {
 
 	sigaction := t.sigactions[which]
 
-	previous_mask := t.masked_signals
+	previous_mask := if t.sigsuspend_restore {
+		t.sigsuspend_restore = false
+		t.sigsuspend_oldmask
+	} else {
+		t.masked_signals
+	}
 
 	t.masked_signals |= sigaction.sa_mask
 	if sigaction.sa_flags & sa_nodefer == 0 {
 		t.masked_signals |= u64(1) << which
 	}
 
-	// Respect the redzone
-	t.gpr_state.rsp -= 128
-	t.gpr_state.rsp = lib.align_down(t.gpr_state.rsp, 16)
-
-	// Return context
-	t.gpr_state.rsp -= sizeof(cpulocal.GPRState)
-	t.gpr_state.rsp = lib.align_down(t.gpr_state.rsp, 16)
-	mut return_context := unsafe { &cpulocal.GPRState(t.gpr_state.rsp) }
+	// Build the signal frame from the current trap/syscall context. t.gpr_state
+	// may describe an older scheduler preemption and must not be used as the
+	// source of the user stack pointer here.
+	mut signal_sp := context.rsp - 128 // Respect the AMD64 red zone.
+	signal_sp = lib.align_down(signal_sp, 16)
+	signal_sp -= sizeof(cpulocal.GPRState)
+	signal_sp = lib.align_down(signal_sp, 16)
+	mut return_context := unsafe { &cpulocal.GPRState(signal_sp) }
 
 	unsafe {
 		*return_context = *context
 	}
-	t.gpr_state = *context
 	// Siginfo
-	t.gpr_state.rsp -= sizeof(SigInfo)
-	t.gpr_state.rsp = lib.align_down(t.gpr_state.rsp, 16)
-	mut siginfo := unsafe { &SigInfo(t.gpr_state.rsp) }
+	signal_sp -= sizeof(SigInfo)
+	signal_sp = lib.align_down(signal_sp, 16)
+	mut siginfo := unsafe { &SigInfo(signal_sp) }
 
 	unsafe { C.memset(voidptr(siginfo), 0, sizeof(SigInfo)) }
 	siginfo.si_signo = which
 
 	// Alignment
-	t.gpr_state.rsp -= 8
-
-	// Common handler will take (which, siginfo, sigaction, ret_context, prev_mask)
-	t.gpr_state.rip = t.sigentry
-
-	t.gpr_state.rdi = u64(which)
-	t.gpr_state.rsi = u64(siginfo)
-	t.gpr_state.rdx = u64(sigaction.sa_sigaction)
-	t.gpr_state.rcx = u64(return_context)
-	t.gpr_state.r8 = previous_mask
-
-	sched.yield(false)
+	signal_sp -= 8
+	// Modify the active return frame directly. This works both at syscall exit
+	// and when returning from a scheduler interrupt without a nested context
+	// switch.
+	mut active_context := unsafe { context }
+	active_context.rsp = signal_sp
+	active_context.rip = t.sigentry
+	active_context.rdi = u64(which)
+	active_context.rsi = u64(siginfo)
+	active_context.rdx = u64(sigaction.sa_sigaction)
+	active_context.rcx = u64(return_context)
+	active_context.r8 = previous_mask
 }
 
 pub fn sendsig(_thread &proc.Thread, signal u8) {
 	mut t := unsafe { _thread }
 
 	katomic.bts(mut &t.pending_signals, signal)
+	event.trigger(mut &t.signal_event, false)
 
 	// Try to stop an event_await()
 	sched.enqueue_thread(t, true)
+}
+
+pub fn process_group_exists(pgid int, sid int) bool {
+	if pgid <= 0 {
+		return false
+	}
+	for i := 1; i < 65536; i++ {
+		member := processes[i]
+		if member != unsafe { nil } && member.pgid == pgid && (sid == 0 || member.sid == sid) {
+			return true
+		}
+	}
+	return false
+}
+
+pub fn signal_process_group(pgid int, signal int) bool {
+	mut delivered := false
+	for i := 1; i < 65536; i++ {
+		member := processes[i]
+		if member == unsafe { nil } || member.pgid != pgid || member.threads.len == 0 {
+			continue
+		}
+		delivered = true
+		if signal != 0 {
+			sendsig(member.threads[0], u8(signal))
+		}
+	}
+	return delivered
 }
 
 pub fn syscall_kill(_ voidptr, pid int, signal int) (u64, u64) {
@@ -357,12 +630,54 @@ pub fn syscall_kill(_ voidptr, pid int, signal int) (u64, u64) {
 		C.printf(c'\e[32m%s\e[m: returning\n', process.name.str)
 	}
 
-	if signal > 0 {
-		sendsig(processes[pid].threads[0], u8(signal))
-	} else {
-		panic('sendsig: Values of signal <= 0 not supported')
+	if signal < 0 || signal >= 64 {
+		return errno.err, errno.einval
 	}
 
+	mut delivered := false
+	if pid > 0 {
+		if pid >= 65536 {
+			return errno.err, errno.esrch
+		}
+		target := processes[pid]
+		if target == unsafe { nil } || target.threads.len == 0 {
+			return errno.err, errno.esrch
+		}
+		if signal != 0 {
+			sendsig(target.threads[0], u8(signal))
+		}
+		return 0, 0
+	}
+
+	target_pgid := if pid == 0 {
+		process.pgid
+	} else if pid < -1 {
+		-pid
+	} else {
+		-1
+	}
+	for i := 1; i < 65536; i++ {
+		target := processes[i]
+		if target == unsafe { nil } || target.threads.len == 0 {
+			continue
+		}
+		if pid == -1 {
+			if target.pid == 1 {
+				continue
+			}
+		} else if target.pgid != target_pgid {
+			continue
+		}
+
+		delivered = true
+		if signal != 0 {
+			sendsig(target.threads[0], u8(signal))
+		}
+	}
+
+	if !delivered {
+		return errno.err, errno.esrch
+	}
 	return 0, 0
 }
 
@@ -441,14 +756,23 @@ pub fn syscall_waitpid(_ voidptr, pid int, _status &int, options int) (u64, u64)
 	}
 
 	block := options & wnohang == 0
-	which := event.await(mut events, block) or { return errno.err, errno.eintr }
+	which := event.await(mut events, block) or {
+		// WNOHANG reports that matching children exist but none have changed
+		// state by returning zero; it is not an interrupted wait.
+		if !block {
+			return 0, 0
+		}
+		return errno.err, errno.eintr
+	}
 
 	if child == unsafe { nil } {
 		child = current_process.children[which]
 	}
 
-	unsafe {
-		*status = child.status
+	if status != unsafe { nil } {
+		unsafe {
+			*status = child.status
+		}
 	}
 	ret := child.pid
 
@@ -468,6 +792,8 @@ pub fn syscall_exit(_ voidptr, status int) {
 	defer {
 		C.printf(c'\e[32m%s\e[m: returning\n', current_process.name.str)
 	}
+
+	disarm_itimer_real(current_process)
 
 	mut old_pagemap := current_process.pagemap
 
@@ -659,6 +985,9 @@ pub fn start_program(execve bool, dir &fs.VFSNode, path string, argv []string, e
 	} else {
 		mut t := proc.current_thread()
 		mut process := t.process
+		old_mask := t.masked_signals
+		old_pending := t.pending_signals
+		old_sigactions := t.sigactions
 
 		mut old_pagemap := process.pagemap
 
@@ -678,8 +1007,18 @@ pub fn start_program(execve bool, dir &fs.VFSNode, path string, argv []string, e
 		// old_threads := process.threads
 		process.threads = []&proc.Thread{}
 
-		sched.new_user_thread(process, true, entry_point, unsafe { nil }, 0, argv, envp,
-			auxval, true)?
+		mut new_thread := sched.new_user_thread(process, true, entry_point, unsafe { nil }, 0,
+			argv, envp, auxval, true)?
+		// POSIX exec semantics: the signal mask and pending set survive. Caught
+		// dispositions are reset, while dispositions set to SIG_IGN remain
+		// ignored. Xorg's xinit readiness handshake relies on this behavior.
+		new_thread.masked_signals = old_mask
+		new_thread.pending_signals = old_pending
+		for i := 0; i < old_sigactions.len; i++ {
+			if old_sigactions[i].sa_sigaction == sig_ign {
+				new_thread.sigactions[i] = old_sigactions[i]
+			}
+		}
 
 		unsafe {
 			argv.free()

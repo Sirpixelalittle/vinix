@@ -60,7 +60,8 @@ pub fn create_dev_id() u64 {
 
 pub fn default_ioctl(handle voidptr, request u64, _ voidptr) ?int {
 	match request {
-		ioctl.tcgets, ioctl.tcsets, ioctl.tiocsctty, ioctl.tiocgwinsz {
+		ioctl.tcgets, ioctl.tcsets, ioctl.tiocsctty, ioctl.tiocgpgrp, ioctl.tiocspgrp,
+		ioctl.tiocgwinsz {
 			errno.set(errno.enotty)
 			return none
 		}
