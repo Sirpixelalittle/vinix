@@ -230,6 +230,14 @@ fn keyboard_handler() {
 		event.await(mut events, true) or {}
 		unsafe { events.free() }
 		input_byte := read_ps2()
+		keyboard.submit_scancode(input_byte)
+
+		// A raw keyboard consumer such as Xorg owns input while the device is
+		// open. Keep the console translator from duplicating those keystrokes
+		// into the shell that launched the display server.
+		if keyboard.is_grabbed() {
+			continue
+		}
 
 		if input_byte == 0xe0 {
 			console_extra_scancodes = true
@@ -455,6 +463,7 @@ pub fn initialise() {
 	console_res.status |= file.pollout
 
 	fs.devtmpfs_add_device(console_res, 'console')
+	keyboard.initialise_device()
 
 	spawn keyboard_handler()
 }
