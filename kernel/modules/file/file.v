@@ -8,6 +8,7 @@ import errno
 import stat
 import event
 import event.eventstruct
+import ioctl
 import memory.mmap
 import time
 
@@ -199,6 +200,18 @@ pub fn (mut this Handle) write(buf voidptr, count u64) ?i64 {
 }
 
 pub fn (mut this Handle) ioctl(request u64, argp voidptr) ?int {
+	if request == ioctl.fionbio {
+		if argp == unsafe { nil } {
+			errno.set(errno.efault)
+			return none
+		}
+		if unsafe { *&int(argp) } != 0 {
+			this.flags |= resource.o_nonblock
+		} else {
+			this.flags &= ~resource.o_nonblock
+		}
+		return 0
+	}
 	return this.resource.ioctl(voidptr(this), request, argp)
 }
 

@@ -4,6 +4,8 @@ module ioctl
 
 pub const fionread = 0x541b
 
+pub const fionbio = 0x5421
+
 pub const ioc_nrbits = 8
 pub const ioc_typebits = 8
 pub const ioc_sizebits = 14
