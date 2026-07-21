@@ -169,7 +169,7 @@ pub fn enqueue_thread(_thread &proc.Thread, by_signal bool) bool {
 	katomic.store(mut &t.enqueued_by_signal, by_signal)
 
 	for i := u64(0); i < max_running_threads; i++ {
-		if katomic.cas[&proc.Thread](mut &scheduler_running_queue[i], unsafe { nil },
+		if katomic.cas_ptr[proc.Thread](&scheduler_running_queue[i], unsafe { nil },
 			t)
 		{
 			t.is_in_queue = true
@@ -197,7 +197,7 @@ pub fn dequeue_thread(_thread &proc.Thread) bool {
 	}
 
 	for i := u64(0); i < max_running_threads; i++ {
-		if katomic.cas[&proc.Thread](mut &scheduler_running_queue[i], t, unsafe { nil }) {
+		if katomic.cas_ptr[proc.Thread](&scheduler_running_queue[i], t, unsafe { nil }) {
 			t.is_in_queue = false
 			return true
 		}

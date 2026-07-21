@@ -45,7 +45,7 @@ __global (
 
 pub fn allocate_pid(process &Process) ?int {
 	for i := int(1); i < 65536; i++ {
-		if katomic.cas[&Process](mut &processes[i], unsafe { nil }, process) {
+		if katomic.cas_ptr[Process](&processes[i], unsafe { nil }, process) {
 			return i
 		}
 	}
@@ -53,5 +53,5 @@ pub fn allocate_pid(process &Process) ?int {
 }
 
 pub fn free_pid(pid int) {
-	katomic.store[&Process](mut &processes[pid], unsafe { nil })
+	katomic.store_ptr[Process](&processes[pid], unsafe { nil })
 }
