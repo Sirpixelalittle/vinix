@@ -1,0 +1,36 @@
+--- a/xterm_io.h
++++ b/xterm_io.h
+@@ -41,6 +41,10 @@
+  * as they are integrated with the configure script.
+  */
++#ifdef __vinix__
++#define USE_POSIX_TERMIOS 1
++#endif
++
+ #if defined(__minix)
+ #define USE_POSIX_TERMIOS 1
+ #undef HAVE_POSIX_OPENPT	/* present, does not work */
+ #endif
+--- a/main.c
++++ b/main.c
+@@ -160,6 +160,11 @@
+ #endif
+ #endif
+-
++
++#ifdef __vinix__
++#define USE_SYSV_PGRP
++#define USE_SYSV_SIGNALS
++#endif
++
+ #ifdef __CYGWIN__
+ #define WTMP
+ #endif
+@@ -686,5 +691,7 @@
+ #define TAB3 OXTABS
+ #elif defined(XTABS)
+ #define TAB3 XTABS
++#else
++#define TAB3 0
+ #endif
+ #endif

@@ -1,0 +1,35 @@
+#! /bin/sh
+
+name=xorg-xterm
+repology_id=xterm
+version=410
+revision=1
+tarball_url="https://invisible-island.net/archives/xterm/current/xterm-${version}.tgz"
+tarball_blake2b="649d5fa7ec41ead6026d8b094499a81b45fbd032396abcd29e5153a5c5796d29f39101b1a72c90c5a5633d1d91726ad87451003bb8489015e139fe583005594e"
+imagedeps="ncurses-bin"
+hostdeps="gcc pkg-config"
+deps="core-libs fontconfig freetype2 libice libx11 libxaw libxext libxft libxinerama libxmu libxpm libxt ncurses"
+
+prepare() {
+    autotools_recursive_regen
+}
+
+configure() {
+        cf_cv_lib_tgetent=no \
+        cf_cv_lib_part_tgetent=-ltinfow \
+    autotools_configure \
+        --with-app-defaults=/etc/X11/app-defaults \
+        --disable-setuid \
+        --disable-setgid \
+        --disable-luit
+}
+
+build() {
+    make -j${parallelism}
+}
+
+package() {
+    make DESTDIR="${dest_dir}" install
+
+    post_package_strip
+}
