@@ -1,5 +1,27 @@
 --- a/sysdeps/vinix/generic/generic.cpp
 +++ b/sysdeps/vinix/generic/generic.cpp
+@@ -418,1 +418,21 @@
++int sys_fchownat(int dirfd, const char *path, uid_t owner, gid_t group, int flags) {
++	__syscall_ret ret = __syscall(66, dirfd, path, owner, group, flags);
++
++	if (ret.errno != 0)
++		return ret.errno;
++
++	return 0;
++}
++
++int sys_fchmodat(int dirfd, const char *path, mode_t mode, int flags) {
++	__syscall_ret ret = __syscall(68, dirfd, path, mode, flags);
++	if (ret.errno != 0)
++		return ret.errno;
++	return 0;
++}
++
++int sys_chmod(const char *path, mode_t mode) {
++	return sys_fchmodat(AT_FDCWD, path, mode, 0);
++}
++
+ int sys_rmdir(const char *path) {
 @@ -504,3 +504,4 @@
 -	(void)pid;
 -	mlibc::infoLogger() << "mlibc: " << __func__ << " is a stub!\n" << frg::endlog;
@@ -14,6 +36,53 @@
 +	__syscall_ret ret = __syscall(64, pid, pgid);
 +	if (ret.errno != 0)
 +		return ret.errno;
+@@ -522,5 +533,42 @@
+-int sys_ttyname(int fd, char *buf, size_t size) {
+-	(void)fd; (void)buf; (void)size;
+-	mlibc::infoLogger() << "mlibc: " << __func__ << " is a stub!\n" << frg::endlog;
+-	return ENOSYS;
++int sys_setsid(pid_t *sid) {
++	__syscall_ret ret = __syscall(67);
++	if (ret.errno != 0)
++		return ret.errno;
++	*sid = (pid_t)ret.ret;
++	return 0;
++}
++
++int sys_ptsname(int fd, char *buffer, size_t length) {
++	unsigned int index;
++	int result;
++	if(int e = sys_ioctl(fd, TIOCGPTN, &index, &result); e)
++		return e;
++
++	static constexpr char prefix[] = "/dev/pts/";
++	char digits[10];
++	size_t digit_count = 0;
++	do {
++		digits[digit_count++] = static_cast<char>('0' + index % 10);
++		index /= 10;
++	} while(index);
++
++	constexpr size_t prefix_length = sizeof(prefix) - 1;
++	if(prefix_length + digit_count + 1 > length)
++		return ERANGE;
++	for(size_t i = 0; i < prefix_length; ++i)
++		buffer[i] = prefix[i];
++	for(size_t i = 0; i < digit_count; ++i)
++		buffer[prefix_length + i] = digits[digit_count - i - 1];
++	buffer[prefix_length + digit_count] = '\0';
++	return 0;
++}
++
++int sys_unlockpt(int fd) {
++	int unlock = 0;
++	int result;
++	return sys_ioctl(fd, TIOCSPTLCK, &unlock, &result);
++}
++
++int sys_ttyname(int fd, char *buf, size_t size) {
++	return sys_ptsname(fd, buf, size);
+ }
 @@ -821,0 +824,5 @@
 +int sys_sigsuspend(const sigset_t *set) {
 +	__syscall_ret ret = __syscall(54, set);
