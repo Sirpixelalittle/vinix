@@ -71,7 +71,7 @@ pub fn init_syscall_table() {
 	syscall_table[44] = voidptr(fs.syscall_umount)
 	syscall_table[45] = voidptr(userland.syscall_signalfd)
 	syscall_table[46] = voidptr(socket.syscall_socketpair)
-	syscall_table[47] = voidptr(syscall_vacant)
+	syscall_table[47] = voidptr(fs.syscall_renameat)
 	syscall_table[48] = voidptr(mmap.syscall_mprotect)
 	syscall_table[49] = voidptr(syscall_vacant)
 	syscall_table[50] = voidptr(sys.syscall_clock_get)

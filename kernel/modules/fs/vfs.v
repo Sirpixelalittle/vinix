@@ -489,6 +489,13 @@ pub fn syscall_rmdirat(_ voidptr, dirfd int, _path charptr) (u64, u64) {
 		return errno.err, errno.enoent
 	}
 
+	// rmdir must operate on a directory. Non-directory nodes are created with
+	// a nil `children` map, so reject them before touching it — otherwise
+	// `rmdir` on a regular file dereferences null and panics the kernel.
+	if !stat.isdir(target_node.resource.stat.mode) {
+		return errno.err, errno.enotdir
+	}
+
 	if target_node.children.len > 2 {
 		return errno.err, errno.enotempty
 	}
@@ -504,6 +511,102 @@ pub fn syscall_rmdirat(_ voidptr, dirfd int, _path charptr) (u64, u64) {
 		free(target_node.children)
 	}
 	parent_of_tgt_node.children.delete(basename)
+
+	return 0, 0
+}
+
+pub fn syscall_renameat(_ voidptr, olddirfd int, _oldpath charptr, newdirfd int, _newpath charptr) (u64, u64) {
+	mut current_thread := proc.current_thread()
+	mut process := current_thread.process
+
+	C.printf(c'\n\e[32m%s\e[m: renameat(%d, %s, %d, %s)\n', process.name.str, olddirfd,
+		_oldpath, newdirfd, _newpath)
+	defer {
+		C.printf(c'\e[32m%s\e[m: returning\n', process.name.str)
+	}
+
+	oldpath := unsafe { cstring_to_vstring(_oldpath) }
+	newpath := unsafe { cstring_to_vstring(_newpath) }
+
+	if oldpath.len == 0 || newpath.len == 0 {
+		return errno.err, errno.enoent
+	}
+
+	old_base := get_parent_dir(olddirfd, oldpath) or { return errno.err, errno.get() }
+	new_base := get_parent_dir(newdirfd, newpath) or { return errno.err, errno.get() }
+
+	// Resolve the source (its containing directory and entry name).
+	mut src_parent, mut src_node, src_name := path2node(old_base, oldpath)
+	if unsafe { src_node == 0 || src_parent == 0 } {
+		return errno.err, errno.enoent
+	}
+
+	// Resolve the destination's containing directory and entry name.
+	mut dst_parent, mut dst_node, dst_name := path2node(new_base, newpath)
+	if unsafe { dst_parent == 0 } {
+		return errno.err, errno.enoent
+	}
+
+	if dst_name.len > name_max {
+		return errno.err, errno.enametoolong
+	}
+
+	// Renaming a path onto itself is a no-op.
+	if voidptr(src_node) == voidptr(dst_node) {
+		return 0, 0
+	}
+
+	// Only moves within the same filesystem are supported (tree splice).
+	if voidptr(src_parent.filesystem) != voidptr(dst_parent.filesystem) {
+		return errno.err, errno.exdev
+	}
+
+	src_is_dir := stat.isdir(src_node.resource.stat.mode)
+
+	// A directory may not be moved into itself or one of its own
+	// descendants, which would splice a cycle into the tree.
+	if src_is_dir {
+		mut walk := unsafe { dst_parent }
+		for voidptr(walk) != unsafe { nil } {
+			if voidptr(walk) == voidptr(src_node) {
+				return errno.err, errno.einval
+			}
+			walk = walk.parent
+		}
+	}
+
+	// POSIX rename atomically replaces an existing destination.
+	if unsafe { dst_node != 0 } {
+		dst_is_dir := stat.isdir(dst_node.resource.stat.mode)
+		if dst_is_dir && !src_is_dir {
+			return errno.err, errno.eisdir
+		}
+		if !dst_is_dir && src_is_dir {
+			return errno.err, errno.enotdir
+		}
+		if dst_is_dir && dst_node.children.len > 2 {
+			return errno.err, errno.enotempty
+		}
+		dst_node.resource.unlink(unsafe { nil }) or {}
+		dst_node.resource.unref(unsafe { nil }) or {}
+		dst_parent.children.delete(dst_name)
+	}
+
+	// Splice the source node out of its old parent and into the new one.
+	src_parent.children.delete(src_name)
+	src_node.name = dst_name
+	src_node.parent = dst_parent
+	unsafe {
+		dst_parent.children[dst_name] = src_node
+	}
+
+	// Keep a moved directory's ".." pointing at its new parent.
+	if src_is_dir && unsafe { src_node.children != 0 } {
+		if '..' in src_node.children {
+			mut dotdot := unsafe { src_node.children['..'] }
+			dotdot.redir = dst_parent
+		}
+	}
 
 	return 0, 0
 }
