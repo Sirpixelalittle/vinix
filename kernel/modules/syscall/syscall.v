@@ -73,10 +73,14 @@ fn syscall_entry() {
 		pop r12
 		pop r13
 		pop r14
-		pop r15 // Restore user stack
-		mov rsp, gs:[32]
+		pop r15
+		// The frame below the saved registers already contains
+		// RIP, CS, RFLAGS, RSP and SS. Returning through it is required when
+		// signal dispatch replaces the userspace context: SYSRET would take
+		// RIP from RCX and RFLAGS from R11, which are signal-handler arguments.
+		add rsp, 8 // Skip the synthetic error code.
 		swapgs
-		sysretq
+		iretq
 		; ; ; memory
 	}
 }
