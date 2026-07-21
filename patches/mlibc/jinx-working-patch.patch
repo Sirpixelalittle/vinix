@@ -1,0 +1,41 @@
+diff --color -urN --no-dereference '--exclude=.git' mlibc-clean/sysdeps/vinix/generic/generic.cpp mlibc-workdir/sysdeps/vinix/generic/generic.cpp
+--- mlibc-clean/sysdeps/vinix/generic/generic.cpp
++++ mlibc-workdir/sysdeps/vinix/generic/generic.cpp
+@@ -9,6 +9,7 @@
+ #include <stdlib.h>
+ 
+ #include "syscall.h"
++#include <sys/utsname.h>
+ 
+ #define STUB_ONLY {                             \
+ 	__ensure(!"STUB_ONLY function was called"); \
+@@ -357,6 +358,29 @@
+ 	return 0;
+ }
+ 
++int sys_rename(const char *path, const char *new_path) {
++	return sys_renameat(AT_FDCWD, path, AT_FDCWD, new_path);
++}
++
++int sys_renameat(int olddirfd, const char *old_path, int newdirfd, const char *new_path) {
++	__syscall_ret ret = __syscall(47, olddirfd, old_path, newdirfd, new_path);
++
++	if (ret.errno != 0) {
++		return ret.errno;
++	}
++
++	return 0;
++}
++
++int sys_uname(struct utsname *buf) {
++	__builtin_strcpy(buf->sysname, "Vinix");
++	__builtin_strcpy(buf->nodename, "vinix");
++	__builtin_strcpy(buf->release, "0.0.1");
++	__builtin_strcpy(buf->version, "Vinix");
++	__builtin_strcpy(buf->machine, "x86_64");
++	return 0;
++}
++
+ int sys_link(const char *old_path, const char *new_path) {
+ 	return sys_linkat(AT_FDCWD, old_path, AT_FDCWD, new_path, 0);
+ }
