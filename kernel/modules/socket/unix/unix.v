@@ -547,15 +547,22 @@ fn (mut this UnixSocket) recvmsg(_handle voidptr, msg &sock_pub.MsgHdr, flags in
 	event.trigger(mut this.peer.event, false)
 
 	if msg.msg_name != unsafe { nil } && this.connected {
-		mut actual_size := msg.msg_namelen
-		if actual_size < sizeof(SockaddrUn) {
-			actual_size = sizeof(SockaddrUn)
-		}
+		buffer_size := msg.msg_namelen
+		actual_size := u32(sizeof(SockaddrUn))
+		copy_size := if buffer_size < actual_size { buffer_size } else { actual_size }
 
-		unsafe { C.memcpy(msg.msg_name, voidptr(&this.peer.name), actual_size) }
+		unsafe { C.memcpy(msg.msg_name, voidptr(&this.peer.name), copy_size) }
 		unsafe {
 			msg.msg_namelen = actual_size
 		}
+	}
+
+	// Unix sockets do not support ancillary data yet. recvmsg() still has to
+	// report the amount of control data produced; leaving the input capacity in
+	// msg_controllen makes callers parse uninitialised bytes as cmsghdrs.
+	unsafe {
+		msg.msg_controllen = 0
+		msg.msg_flags = 0
 	}
 
 	C.printf(c'Successfully received %llu bytes\n', transferred)

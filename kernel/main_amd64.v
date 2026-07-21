@@ -30,11 +30,121 @@ import dev.hda
 import dev.random
 import dev.mouse
 import dev.pty
+import block.partition
 import syscall.table
 import socket
 import time
 import x86.hpet
 import limine
+
+@[_linker_section: '.requests']
+@[cinit]
+__global (
+	volatile executable_cmdline_req = limine.LimineExecutableCmdlineRequest{
+		response: unsafe { nil }
+	}
+)
+
+struct BootOptions {
+mut:
+	root       string
+	rootfstype string = 'ext2'
+	read_only  bool
+}
+
+fn parse_boot_options() BootOptions {
+	mut options := BootOptions{}
+	if executable_cmdline_req.response == unsafe { nil } {
+		print('boot: executable command-line response missing\n')
+		return options
+	}
+	if executable_cmdline_req.response.cmdline == unsafe { nil } {
+		print('boot: executable command line is empty\n')
+		return options
+	}
+
+	cmdline := unsafe { cstring_to_vstring(executable_cmdline_req.response.cmdline) }
+	print('boot: command line: ${cmdline}\n')
+	for argument in cmdline.fields() {
+		if argument.starts_with('root=') {
+			options.root = argument[5..]
+		} else if argument.starts_with('rootfstype=') {
+			options.rootfstype = argument[11..]
+		} else if argument == 'ro' {
+			options.read_only = true
+		} else if argument == 'rw' {
+			options.read_only = false
+		}
+	}
+	return options
+}
+
+fn resolve_root_device(specification string) string {
+	if specification.starts_with('PARTUUID=') {
+		return partition.find_by_uuid(specification[9..])
+	}
+	return specification
+}
+
+fn mount_real_root(options BootOptions) bool {
+	if options.rootfstype != 'ext2' {
+		print('root: unsupported filesystem ${options.rootfstype}\n')
+		return false
+	}
+	if !options.read_only {
+		print('root: ext2 write support is not yet safe; refusing a writable root\n')
+		return false
+	}
+
+	root_device := resolve_root_device(options.root)
+	if root_device.len == 0 {
+		print('root: device ${options.root} was not found\n')
+		return false
+	}
+	print('root: mounting ${root_device} as ${options.rootfstype}\n')
+
+	fs.create(vfs_root, '/newroot', 0o755 | stat.ifdir) or {
+		print('root: unable to create staging mount point\n')
+		return false
+	}
+	fs.mount(vfs_root, root_device, '/newroot', options.rootfstype) or {
+		print('root: unable to mount root filesystem\n')
+		return false
+	}
+
+	fs.mount(vfs_root, '', '/newroot/dev', 'devtmpfs') or {
+		print('root: unable to mount /dev\n')
+		return false
+	}
+	fs.mount(vfs_root, '', '/newroot/run', 'tmpfs') or {
+		print('root: unable to mount /run\n')
+		return false
+	}
+	fs.mount(vfs_root, '', '/newroot/tmp', 'tmpfs') or {
+		print('root: unable to mount /tmp\n')
+		return false
+	}
+	fs.mount(vfs_root, '', '/newroot/root', 'tmpfs') or {
+		print('root: unable to mount /root\n')
+		return false
+	}
+	fs.mount(vfs_root, '', '/newroot/var/log', 'tmpfs') or {
+		print('root: unable to mount /var/log\n')
+		return false
+	}
+	fs.mount(vfs_root, '', '/newroot/var/lib/xkb', 'tmpfs') or {
+		print('root: unable to mount /var/lib/xkb\n')
+		return false
+	}
+
+	old_root := fs.switch_root(vfs_root, '/newroot') or {
+		print('root: unable to switch root\n')
+		return false
+	}
+	fs.destroy_detached_tree(old_root)
+	print('root: switched to disk-backed filesystem\n')
+	return true
+}
 
 fn kmain_thread() {
 	term.framebuffer_init()
@@ -44,12 +154,16 @@ fn kmain_thread() {
 	pipe.initialise()
 	futex.initialise()
 	fs.initialise()
+	fs.register_ext2()
 
 	fs.mount(vfs_root, '', '/', 'tmpfs') or {}
 	fs.create(vfs_root, '/dev', 0o644 | stat.ifdir) or {}
 	fs.mount(vfs_root, '', '/dev', 'devtmpfs') or {}
 
-	initramfs.initialise()
+	boot_options := parse_boot_options()
+	if boot_options.root.len == 0 {
+		initramfs.initialise()
+	}
 
 	streams.initialise()
 	pty.initialise()
@@ -61,10 +175,12 @@ fn kmain_thread() {
 	mouse.initialise()
 	hda.initialize()
 
-	$if !prod {
-		ata.initialise()
-		nvme.initialise()
-		ahci.initialise()
+	ata.initialise()
+	nvme.initialise()
+	ahci.initialise()
+
+	if boot_options.root.len != 0 && !mount_real_root(boot_options) {
+		panic('Could not mount the requested root filesystem')
 	}
 
 	userland.start_program(false, vfs_root, '/sbin/init', ['/sbin/init'], [], '/dev/console',

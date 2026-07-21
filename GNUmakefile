@@ -1,12 +1,21 @@
-QEMUFLAGS ?= -M q35,smm=off -m 8G -cdrom vinix.iso -serial stdio -smp 4
+QEMUFLAGS ?= -M q35,smm=off -m 2G -cdrom vinix.iso -serial stdio -smp 4
+QEMUIMAGEFLAGS ?= -M q35,smm=off -m 2G -drive file=vinix.img,format=raw -serial stdio -smp 4
 
 .PHONY: all
 all:
 	rm -f vinix.iso
 	$(MAKE) vinix.iso
 
-vinix.iso: jinx
+vinix.iso: jinx build-support/makeiso.sh build-support/makerecovery.sh build-support/limine.conf
 	./build-support/makeiso.sh
+
+.PHONY: image
+image:
+	rm -f vinix.img
+	$(MAKE) vinix.img
+
+vinix.img: jinx build-support/makeimage.sh build-support/limine-disk.conf
+	./build-support/makeimage.sh
 
 .PHONY: debug
 debug:
@@ -55,9 +64,26 @@ run-lingemu: vinix.iso
 run: vinix.iso
 	qemu-system-x86_64 $(QEMUFLAGS)
 
+.PHONY: run-image
+run-image: vinix.img
+	qemu-system-x86_64 $(QEMUIMAGEFLAGS)
+
+.PHONY: run-image-kvm
+run-image-kvm: vinix.img
+	qemu-system-x86_64 -enable-kvm -cpu host $(QEMUIMAGEFLAGS)
+
+.PHONY: run-image-uefi
+run-image-uefi: vinix.img ovmf/ovmf-code-x86_64.fd ovmf/ovmf-vars-x86_64.fd
+	qemu-system-x86_64 \
+		-enable-kvm \
+		-cpu host \
+		-drive if=pflash,unit=0,format=raw,file=ovmf/ovmf-code-x86_64.fd,readonly=on \
+		-drive if=pflash,unit=1,format=raw,file=ovmf/ovmf-vars-x86_64.fd \
+		$(QEMUIMAGEFLAGS)
+
 .PHONY: clean
 clean:
-	rm -rf iso_root sysroot vinix.iso initramfs.tar
+	rm -rf iso_root sysroot vinix.iso vinix.img initramfs.tar
 
 .PHONY: distclean
 distclean: clean

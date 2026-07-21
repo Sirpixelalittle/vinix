@@ -12,8 +12,9 @@ if ! [ -d host-pkgs/limine ]; then
     ./jinx host-build limine
 fi
 
-# Make an initramfs with the sysroot.
-( cd sysroot && tar cf ../initramfs.tar * )
+# Make a small recovery initramfs. The complete installed system belongs on a
+# disk-backed root filesystem, not in the boot module.
+./build-support/makerecovery.sh sysroot initramfs.tar
 
 # Prepare the iso and boot directories.
 rm -rf iso_root

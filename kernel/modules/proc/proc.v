@@ -41,6 +41,16 @@ pub mut:
 	sa_restorer  voidptr // SA_RESTORER trampoline (musl: __restore_rt)
 }
 
+// Native Vinix userspace deliberately has no sa_restorer field. Keep this
+// syscall ABI structure separate from SigAction: the latter also stores the
+// Linux/AArch64 restorer internally and is therefore eight bytes larger.
+pub struct UserSigAction {
+pub mut:
+	sa_sigaction voidptr
+	sa_mask      u64
+	sa_flags     int
+}
+
 __global (
 	processes [65536]&Process
 )

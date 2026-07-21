@@ -41,7 +41,7 @@ __global (
 	volatile dtb_req = limine.LimineDTBRequest{
 		response: unsafe { nil }
 	}
-	volatile kernel_file_req = limine.LimineKernelFileRequest{
+	volatile executable_cmdline_req = limine.LimineExecutableCmdlineRequest{
 		response: unsafe { nil }
 	}
 	minimal_apple_bringup = true
@@ -193,17 +193,16 @@ fn get_dt_base(compat string, default_base u64) u64 {
 // default to avoid hard resets on real hardware. Use kernel cmdline
 // "vinix.apple_gpu=1" (or "vinix.minimal_apple=0") to enable it.
 fn configure_apple_bringup_from_cmdline() {
-	if kernel_file_req.response == unsafe { nil } {
+	if executable_cmdline_req.response == unsafe { nil } {
 		print('boot cmdline: unavailable, using minimal Apple bring-up\n')
 		return
 	}
-	kernel_file := kernel_file_req.response.kernel_file
-	if kernel_file == unsafe { nil } || kernel_file.cmdline == unsafe { nil } {
+	if executable_cmdline_req.response.cmdline == unsafe { nil } {
 		print('boot cmdline: empty, using minimal Apple bring-up\n')
 		return
 	}
 
-	cmdline := unsafe { cstring_to_vstring(kernel_file.cmdline) }
+	cmdline := unsafe { cstring_to_vstring(executable_cmdline_req.response.cmdline) }
 	if cmdline.len == 0 {
 		print('boot cmdline: empty, using minimal Apple bring-up\n')
 		return

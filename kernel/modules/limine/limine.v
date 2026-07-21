@@ -76,6 +76,26 @@ pub mut:
 	response &LimineBootloaderInfoResponse
 }
 
+// Executable command line
+
+pub struct LimineExecutableCmdlineResponse {
+pub mut:
+	revision u64
+	cmdline  charptr
+}
+
+pub struct LimineExecutableCmdlineRequest {
+pub mut:
+	id       [4]u64 = [
+		u64(0xc7b1dd30df4c8b88),
+		0x0a82e883a194f07b,
+		0x4b161536e598651e,
+		0xb390ad4a2f1f303a,
+	]!
+	revision u64
+	response &LimineExecutableCmdlineResponse
+}
+
 // Stack size
 
 pub struct LimineStackSizeResponse {

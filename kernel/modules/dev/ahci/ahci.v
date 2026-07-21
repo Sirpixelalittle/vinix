@@ -12,6 +12,7 @@ import block.partition
 import fs
 import katomic
 import time.sys
+import lib
 
 const ahci_class = 0x1
 const ahci_subclass = 0x6
@@ -33,6 +34,8 @@ const fis_bist = 0x58
 const fis_pio_setup = 0x5f
 const fis_device_bits = 0xa1
 const sector_size = 0x200
+const ahci_max_transfer_sectors = u64(8192) // one PRDT entry, 4 MiB maximum
+const ahci_spin_limit = u64(100000000)
 
 @[packed]
 struct AHCIRegisters {
@@ -184,21 +187,26 @@ fn (mut dev AHCIDevice) read(handle voidptr, buffer voidptr, loc u64, count u64)
 		errno.set(errno.eio)
 		return none
 	}
+	if count == 0 {
+		return 0
+	}
 
-	start_blk := loc / dev.stat.blksize
-	page_cnt := count / dev.stat.blksize
+	logical_block_size := u64(dev.stat.blksize)
+	start_blk := loc / logical_block_size
+	sector_count := count / logical_block_size
+	page_count := lib.div_roundup(count, page_size)
+	physical_buffer := memory.pmm_alloc(page_count)
+	aligned_buffer := voidptr(u64(physical_buffer) + higher_half)
 
-	aligned_buffer := voidptr(u64(memory.pmm_alloc(u64(page_cnt))) + higher_half)
-
-	if dev.rw_lba(aligned_buffer, u64(start_blk), u64(page_cnt), false) == -1 {
+	if dev.rw_lba(aligned_buffer, start_blk, sector_count, false) == -1 {
 		errno.set(errno.eio)
-		memory.pmm_free(aligned_buffer, u64(page_cnt))
+		memory.pmm_free(physical_buffer, page_count)
 		return none
 	}
 
 	unsafe { C.memcpy(buffer, aligned_buffer, count) }
 
-	memory.pmm_free(voidptr(u64(aligned_buffer) - higher_half), u64(page_cnt))
+	memory.pmm_free(physical_buffer, page_count)
 
 	return i64(count)
 }
@@ -208,20 +216,26 @@ fn (mut dev AHCIDevice) write(handle voidptr, buffer voidptr, loc u64, count u64
 		errno.set(errno.eio)
 		return none
 	}
+	if count == 0 {
+		return 0
+	}
 
-	start_blk := loc / dev.stat.blksize
-	page_cnt := count / dev.stat.blksize
+	logical_block_size := u64(dev.stat.blksize)
+	start_blk := loc / logical_block_size
+	sector_count := count / logical_block_size
+	page_count := lib.div_roundup(count, page_size)
+	physical_buffer := memory.pmm_alloc(page_count)
+	aligned_buffer := voidptr(u64(physical_buffer) + higher_half)
 
-	aligned_buffer := voidptr(u64(memory.pmm_alloc(u64(page_cnt))) + higher_half)
 	unsafe { C.memcpy(aligned_buffer, buffer, count) }
 
-	if dev.rw_lba(aligned_buffer, u64(start_blk), u64(page_cnt), true) == -1 {
+	if dev.rw_lba(aligned_buffer, start_blk, sector_count, true) == -1 {
 		errno.set(errno.eio)
-		memory.pmm_free(aligned_buffer, u64(page_cnt))
+		memory.pmm_free(physical_buffer, page_count)
 		return none
 	}
 
-	memory.pmm_free(voidptr(u64(aligned_buffer) - higher_half), u64(page_cnt))
+	memory.pmm_free(physical_buffer, page_count)
 
 	return i64(count)
 }
@@ -259,36 +273,94 @@ fn (mut d AHCIDevice) find_cmd_slot() ?u32 {
 	return none
 }
 
-fn (mut d AHCIDevice) set_prdt(cmd_hdr &AHCIHBACommand, buffer u64, interrupt u32, byte_cnt u32) &AHCIHBACommandTable {
+fn (mut d AHCIDevice) set_prdt(cmd_hdr &AHCIHBACommand, buffer u64, interrupt u32, byte_count u32) &AHCIHBACommandTable {
 	mut volatile cmd_table := unsafe {
 		&AHCIHBACommandTable((u64(cmd_hdr.ctba) | (u64(cmd_hdr.ctbau) << 32)) + higher_half)
 	}
 
 	cmd_table.prdt[0].dba = u32(buffer)
 	cmd_table.prdt[0].dbau = u32(buffer >> 32)
-	cmd_table.prdt[0].dbc = byte_cnt | ((interrupt & 1) << 31)
+	cmd_table.prdt[0].dbc = ((byte_count - 1) & 0x3fffff) | ((interrupt & 1) << 31)
 
 	return cmd_table
 }
 
-fn (mut d AHCIDevice) send_cmd(slot u32) {
-	for (d.regs.tfd & (0x88)) != 0 {}
-
+fn (mut d AHCIDevice) stop_engine() bool {
 	d.regs.cmd &= ~hba_cmd_st
+	mut spins := u64(0)
+	for d.regs.cmd & hba_cmd_cr != 0 {
+		if spins == ahci_spin_limit {
+			return false
+		}
+		spins++
+		asm volatile amd64 { pause }
+	}
 
-	for (d.regs.cmd & hba_cmd_cr) != 0 {}
-
-	d.regs.cmd |= hba_cmd_fr | hba_cmd_st
-	d.regs.ci = 1 << slot
-
-	for d.regs.ci & (1 << slot) != 0 {}
-
-	d.regs.cmd &= ~hba_cmd_st
-	for (d.regs.cmd & hba_cmd_st) != 0 {}
 	d.regs.cmd &= ~hba_cmd_fre
+	spins = 0
+	for d.regs.cmd & hba_cmd_fr != 0 {
+		if spins == ahci_spin_limit {
+			return false
+		}
+		spins++
+		asm volatile amd64 { pause }
+	}
+	return true
+}
+
+fn (mut d AHCIDevice) start_engine() bool {
+	mut spins := u64(0)
+	for d.regs.cmd & hba_cmd_cr != 0 {
+		if spins == ahci_spin_limit {
+			return false
+		}
+		spins++
+		asm volatile amd64 { pause }
+	}
+	d.regs.cmd |= hba_cmd_fre
+	d.regs.cmd |= hba_cmd_st
+	return true
+}
+
+fn (mut d AHCIDevice) send_cmd(slot u32) bool {
+	mut spins := u64(0)
+	for d.regs.tfd & 0x88 != 0 {
+		if spins == ahci_spin_limit {
+			return false
+		}
+		spins++
+		asm volatile amd64 { pause }
+	}
+
+	// PxIS is write-one-to-clear. The driver is polling, so no guest interrupt
+	// is required, but clearing stale task-file errors is still necessary.
+	d.regs.ints = 0xffffffff
+	d.regs.ci |= 1 << slot
+
+	spins = 0
+	for d.regs.ci & (1 << slot) != 0 {
+		if d.regs.ints & (1 << 30) != 0 || spins == ahci_spin_limit {
+			return false
+		}
+		spins++
+		asm volatile amd64 { pause }
+	}
+	return d.regs.ints & (1 << 30) == 0 && d.regs.tfd & 1 == 0
 }
 
 fn (mut d AHCIDevice) rw_lba(buffer voidptr, start u64, cnt u64, rw bool) int {
+	if cnt == 0 || cnt > ahci_max_transfer_sectors {
+		return -1
+	}
+
+	// This is deliberately a synchronous, polled driver. Serialising a port
+	// keeps command ownership and its DMA buffer valid until PxCI is cleared.
+	// An asynchronous implementation will need per-slot completion state.
+	d.l.acquire()
+	defer {
+		d.l.release()
+	}
+
 	cmd_slot := d.find_cmd_slot() or {
 		print('ahci: no free cmd slot (come back later)\n')
 		return -1
@@ -299,11 +371,15 @@ fn (mut d AHCIDevice) rw_lba(buffer voidptr, start u64, cnt u64, rw bool) int {
 			cmd_slot * sizeof(AHCIHBACommand))
 	}
 
-	cmd_hdr.flags &= ~(0b11111 | (1 << 6))
-	cmd_hdr.flags |= u16(sizeof(AHCIFISh2d) / 4)
+	cmd_hdr.flags = u16(sizeof(AHCIFISh2d) / 4)
+	if rw {
+		cmd_hdr.flags |= 1 << 6
+	}
 	cmd_hdr.prdtl = 1
+	cmd_hdr.prdbc = 0
 
-	mut volatile cmd_table := d.set_prdt(cmd_hdr, u64(buffer) - higher_half, 1, u32(cnt * sector_size - 1))
+	mut volatile cmd_table := d.set_prdt(cmd_hdr, u64(buffer) - higher_half, 1,
+		u32(cnt * sector_size))
 
 	mut volatile cmd_ptr := unsafe { &AHCIFISh2d(&cmd_table.cfis) }
 	unsafe { C.memset(cmd_ptr, 0, sizeof(AHCIFISh2d)) }
@@ -328,14 +404,17 @@ fn (mut d AHCIDevice) rw_lba(buffer voidptr, start u64, cnt u64, rw bool) int {
 	cmd_ptr.countl = u8(cnt & 0xff)
 	cmd_ptr.counth = u8((cnt >> 8) & 0xff)
 
-	d.send_cmd(cmd_slot)
+	if !d.send_cmd(cmd_slot) {
+		print('ahci: command failed at LBA ${start}, sectors ${cnt}\n')
+		return -1
+	}
 
 	return 0
 }
 
 fn (mut d AHCIDevice) initialise() ?int {
-	cmd_slot := d.find_cmd_slot() or {
-		print('ahci: no free cmd slot (come back later)\n')
+	if !d.stop_engine() {
+		print('ahci: timed out while stopping command engine\n')
 		return none
 	}
 
@@ -361,20 +440,32 @@ fn (mut d AHCIDevice) initialise() ?int {
 	d.regs.fb = u32(fib_base)
 	d.regs.fbu = u32(fib_base >> 32)
 
-	d.regs.cmd |= (1 << 0) | (1 << 4)
+	if !d.start_engine() {
+		print('ahci: timed out while starting command engine\n')
+		return none
+	}
+
+	cmd_slot := d.find_cmd_slot() or {
+		print('ahci: no free command slot during identify\n')
+		return none
+	}
 
 	mut volatile cmd_hdr := unsafe {
 		&AHCIHBACommand((u64(d.regs.clb) | (u64(d.regs.clbu) << 32)) + higher_half +
 			cmd_slot * sizeof(AHCIHBACommand))
 	}
 
-	cmd_hdr.flags &= ~0b11111 | (1 << 7)
-	cmd_hdr.flags |= u16(sizeof(AHCIFISh2d) / 4)
+	cmd_hdr.flags = u16(sizeof(AHCIFISh2d) / 4)
 	cmd_hdr.prdtl = 1
+	cmd_hdr.prdbc = 0
 
-	mut identity := unsafe { &u16(u64(memory.pmm_alloc(1)) + higher_half) }
+	identity_physical := memory.pmm_alloc(1)
+	defer {
+		memory.pmm_free(identity_physical, 1)
+	}
+	mut identity := unsafe { &u16(u64(identity_physical) + higher_half) }
 
-	mut volatile cmd_table := d.set_prdt(cmd_hdr, u64(identity) - higher_half, 1, 511)
+	mut volatile cmd_table := d.set_prdt(cmd_hdr, u64(identity) - higher_half, 1, sector_size)
 
 	mut volatile cmd_ptr := unsafe { &AHCIFISh2d(&cmd_table.cfis) }
 	unsafe { C.memset(cmd_ptr, 0, sizeof(AHCIFISh2d)) }
@@ -383,7 +474,10 @@ fn (mut d AHCIDevice) initialise() ?int {
 	cmd_ptr.flags = (1 << 7)
 	cmd_ptr.fis_type = fis_reg_h2d
 
-	d.send_cmd(cmd_slot)
+	if !d.send_cmd(cmd_slot) {
+		print('ahci: identify command failed\n')
+		return none
+	}
 
 	mut sector_cnt := unsafe { *(&u64(&identity[100])) }
 
@@ -393,6 +487,7 @@ fn (mut d AHCIDevice) initialise() ?int {
 
 	unsafe {
 		C.memcpy(serial_number, &u8(identity) + 20, 20)
+		serial_number[20] = 0
 
 		for i := 0; i < 20; i += 2 { // swap endianess
 			tmp := serial_number[i]
@@ -401,6 +496,7 @@ fn (mut d AHCIDevice) initialise() ?int {
 		}
 
 		C.memcpy(firmware_revision, &u8(identity) + 46, 8)
+		firmware_revision[8] = 0
 
 		for i := 0; i < 8; i += 2 { // swap endianess
 			tmp := firmware_revision[i]
@@ -409,6 +505,7 @@ fn (mut d AHCIDevice) initialise() ?int {
 		}
 
 		C.memcpy(model_number, &u8(identity) + 54, 40)
+		model_number[40] = 0
 
 		for i := 0; i < 40; i += 2 { // swap endianess
 			tmp := model_number[i]
@@ -485,8 +582,9 @@ pub fn (mut c AHCIController) initialise(pci_device &pci.PCIDevice) int {
 	c.regs.ghc |= (1 << 31)
 	c.regs.ghc &= ~(1 << 1)
 
-	c.port_cnt = c.regs.cap & 0b11111
-	c.cmd_slots = (c.regs.cap >> 8) & 0b11111
+	// CAP.NP and CAP.NCS are both zero-based counts.
+	c.port_cnt = (c.regs.cap & 0b11111) + 1
+	c.cmd_slots = ((c.regs.cap >> 8) & 0b11111) + 1
 
 	for i := u64(0); i < c.port_cnt; i++ {
 		if c.regs.pi & (1 << i) != 0 {

@@ -39,6 +39,7 @@ pub mut:
 	parent         &VFSNode             = unsafe { nil }
 	children       &map[string]&VFSNode = unsafe { nil }
 	symlink_target string
+	populated      bool
 }
 
 __global (
@@ -96,6 +97,14 @@ fn reduce_node(node &VFSNode, follow_symlinks bool) &VFSNode {
 	return unsafe { node }
 }
 
+fn ensure_populated(mut node VFSNode) {
+	if unsafe { node == nil } || node.populated || !stat.isdir(node.resource.stat.mode) {
+		return
+	}
+	node.filesystem.populate(node)
+	node.populated = true
+}
+
 fn path2node(parent &VFSNode, path string) (&VFSNode, &VFSNode, string) {
 	if path.len == 0 {
 		errno.set(errno.enoent)
@@ -137,6 +146,7 @@ fn path2node(parent &VFSNode, path string) (&VFSNode, &VFSNode, string) {
 		elem_str := unsafe { cstring_to_vstring(&elem[0]) }
 
 		current_node = reduce_node(current_node, false)
+		ensure_populated(mut current_node)
 
 		if elem_str !in current_node.children {
 			errno.set(errno.enoent)
@@ -273,6 +283,8 @@ pub fn mount(parent &VFSNode, source string, target string, filesystem string) ?
 
 	mut mount_node := f_sys.mount(parent_of_tgt_node, basename, source_node)?
 
+	mount_node.parent = parent_of_tgt_node
+	mount_node.name = basename
 	target_node.mountpoint = mount_node
 
 	mount_node.create_dotentries(parent_of_tgt_node)
@@ -282,6 +294,87 @@ pub fn mount(parent &VFSNode, source string, target string, filesystem string) ?
 	} else {
 		print('vfs: Mounted ${filesystem} to `${target}`\n')
 	}
+}
+
+// switch_root replaces the system-wide root before the first userspace
+// process starts. Returning the old root gives the caller an ownership handle
+// with which to destroy the now-detached staging tree.
+pub fn switch_root(parent &VFSNode, target string) ?&VFSNode {
+	_, target_node, _ := path2node(parent, target)
+	if unsafe { target_node == nil } || !stat.isdir(target_node.resource.stat.mode) {
+		errno.set(errno.enotdir)
+		return none
+	}
+
+	root_candidate := reduce_node(target_node, true)
+	mut new_root := unsafe { &VFSNode(voidptr(root_candidate)) }
+	old_anchor := vfs_root
+	old_root := reduce_node(old_anchor, false)
+	vfs_root = new_root
+	new_root.parent = unsafe { nil }
+	if voidptr(old_anchor) != voidptr(old_root) {
+		// The initial root is represented by an empty anchor with the tmpfs
+		// attached as its mountpoint. Nothing retains the anchor after this.
+		unsafe { free(old_anchor) }
+	}
+
+	if '.' in new_root.children {
+		mut dot := unsafe { new_root.children['.'] }
+		dot.redir = new_root
+	} else {
+		mut dot := create_node(new_root.filesystem, new_root, '.', false)
+		dot.redir = new_root
+		unsafe {
+			new_root.children['.'] = dot
+		}
+	}
+	if '..' in new_root.children {
+		mut dotdot := unsafe { new_root.children['..'] }
+		dotdot.redir = new_root
+	} else {
+		mut dotdot := create_node(new_root.filesystem, new_root, '..', false)
+		dotdot.redir = new_root
+		unsafe {
+			new_root.children['..'] = dotdot
+		}
+	}
+
+	return old_root
+}
+
+fn destroy_detached_node(mut node VFSNode) {
+	if unsafe { node.children != nil } {
+		for name, child in node.children {
+			if name == '.' || name == '..' {
+				continue
+			}
+			mut owned_child := unsafe { &VFSNode(voidptr(child)) }
+			// Mounted filesystems have independent ownership and survive the
+			// staging tree. Destroy only the covered mount-point node.
+			owned_child.mountpoint = unsafe { nil }
+			destroy_detached_node(mut owned_child)
+		}
+
+		if '.' in node.children {
+			unsafe { free(node.children['.']) }
+		}
+		if '..' in node.children {
+			unsafe { free(node.children['..']) }
+		}
+		unsafe { free(node.children) }
+	}
+
+	if unsafe { node.resource != nil } {
+		node.resource.unref(unsafe { nil }) or {}
+	}
+	unsafe { free(node) }
+}
+
+// destroy_detached_tree is only valid for a root no longer reachable through
+// vfs_root and must be called before any process can retain node references.
+pub fn destroy_detached_tree(root &VFSNode) {
+	mut owned_root := unsafe { &VFSNode(voidptr(root)) }
+	destroy_detached_node(mut owned_root)
 }
 
 fn (mut node VFSNode) create_dotentries(parent &VFSNode) {
@@ -333,6 +426,9 @@ pub fn symlink(parent &VFSNode, dest string, target string) ?&VFSNode {
 	}
 
 	target_node = parent_of_tgt_node.filesystem.symlink(parent_of_tgt_node, dest, basename)
+	if unsafe { target_node == nil } {
+		return none
+	}
 
 	unsafe {
 		parent_of_tgt_node.children[basename] = target_node
@@ -419,6 +515,9 @@ pub fn internal_create(parent &VFSNode, name string, mode u32) ?&VFSNode {
 	}
 
 	target_node = parent_of_tgt_node.filesystem.create(parent_of_tgt_node, basename, mode)
+	if unsafe { target_node == nil } {
+		return none
+	}
 
 	unsafe {
 		parent_of_tgt_node.children[basename] = target_node
@@ -1093,6 +1192,7 @@ pub fn syscall_readdir(_ voidptr, fdnum int, mut buf stat.Dirent) (u64, u64) {
 	}
 
 	mut dir_node := unsafe { &VFSNode(dir_handle.node) }
+	ensure_populated(mut dir_node)
 
 	if dir_handle.dirlist_valid == false {
 		dir_handle.dirlist.clear()

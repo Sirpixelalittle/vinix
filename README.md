@@ -24,9 +24,9 @@ virtual machines.
 
 You can grab a pre-built nightly Vinix image at https://github.com/vlang/vinix/releases
 
-Make sure to boot the ISO with enough memory (8+GiB) as, for now, Vinix loads its
-entire root filesystem in a ramdisk in order to be able to more easily boot
-on real hardware.
+The ISO is a small recovery environment. The installed system uses a GPT disk
+image with a disk-backed ext2 root, so its memory use does not scale with the
+size of the package sysroot.
 
 ## Roadmap
 
@@ -52,26 +52,27 @@ The following is a distro-agnostic list of packages needed to build Vinix.
 
 Skip to a paragraph for your host distro if there is any.
 
-`GNU make`, `findutils`, `curl`, `git`, `xz`, `rsync`, `xorriso`, `qemu`
-to test it, and a working C compiler (`cc`) needs to be present.
+`GNU make`, `findutils`, `curl`, `git`, `xz`, `rsync`, `xorriso`, `util-linux`,
+`e2fsprogs`, `dosfstools`, `mtools`, `qemu` to test it, and a working C compiler
+(`cc`) need to be present.
 
 ### Build prerequisites for Ubuntu, Debian, and derivatives
 ```bash
-sudo apt install -y build-essential make findutils curl git xz-utils rsync xorriso qemu-system-x86
+sudo apt install -y build-essential make findutils curl git xz-utils rsync xorriso util-linux e2fsprogs dosfstools mtools qemu-system-x86
 ```
 
 ### Build prerequisites for Arch Linux and derivatives
 ```bash
-sudo pacman -S --needed gcc make findutils curl git xz rsync xorriso qemu
+sudo pacman -S --needed gcc make findutils curl git xz rsync xorriso util-linux e2fsprogs dosfstools mtools qemu
 ```
 
 ### Build prerequisites for Red Hat Linux and derivatives
 ```bash
-sudo yum install -y gcc make findutils curl git xz rsync xorriso qemu
+sudo yum install -y gcc make findutils curl git xz rsync xorriso util-linux e2fsprogs dosfstools mtools qemu
 ```
 ### Build prerequisites for Void Linux and derivatives
 ```bash
-sudo xbps-install -Suv gcc make findutils curl git xz rsync xorriso qemu
+sudo xbps-install -Suv gcc make findutils curl git xz rsync xorriso util-linux e2fsprogs dosfstools mtools qemu
 ```
 ### Building the distro
 
@@ -79,8 +80,15 @@ To build the distro, which includes the cross toolchain necessary
 to build kernel and ports, as well as the kernel itself, run:
 
 ```bash
-make all     # Build the base distro and make filesystem and ISO.
+make image   # Build the base distro and a bootable GPT disk image.
+make all     # Build the small recovery ISO.
 ```
+
+The disk image contains a 64 MiB EFI system partition and a root partition
+sized from the generated sysroot with additional growth space. The root is
+currently mounted read-only while Vinix's ext2 mutation and sync paths are
+being hardened. Runtime paths such as `/dev`, `/run`, `/tmp`, `/root`, and the
+Xorg log/XKB state directories are separate writable filesystems.
 
 *Note:* on certain distros, like Ubuntu 24.04, one may get an error like:
 ```
@@ -101,19 +109,39 @@ variable will allow one to specify a custom set of packages to build/install.
 For example:
 
 ```bash
-PKGS_TO_INSTALL='*' make all
+PKGS_TO_INSTALL='*' make image
 ```
 This will build all packages (may take some time). Or:
 
 ```bash
-PKGS_TO_INSTALL='python sqlite' make all
+PKGS_TO_INSTALL='python sqlite' make image
 ```
-This will build the base system (like `make all`) plus the `python` and `sqlite`
-packages.
+This will install the base system plus the `python` and `sqlite` packages into
+the disk-backed root. `make all` always emits the deliberately small recovery
+ISO, even when extra packages were needed while constructing its sysroot.
+
+The `xorg` meta-package installs the server, standard clients, framebuffer
+video driver, and Vinix keyboard and mouse drivers as one complete environment:
+
+```bash
+PKGS_TO_INSTALL='xorg' make image
+```
 
 ### To test
 
-In Linux, if KVM is available, run with
+To boot the installed disk image on Linux with KVM, run
+
+```
+make run-image-kvm
+```
+
+To boot it with UEFI firmware, run
+
+```
+make run-image-uefi
+```
+
+To boot the recovery ISO on Linux with KVM, run
 
 ```
 make run-kvm

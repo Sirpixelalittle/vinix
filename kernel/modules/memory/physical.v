@@ -210,6 +210,52 @@ pub fn pmm_free(ptr voidptr, count u64) {
 	free_pages += count
 }
 
+// release_bootloader_range transfers a page-aligned Limine-owned allocation
+// into the PMM after the kernel has finished consuming it. It deliberately
+// accepts only an exact page allocation so adjacent bootloader data can never
+// be reclaimed by rounding the start address down.
+pub fn release_bootloader_range(address voidptr, size u64) bool {
+	if size == 0 {
+		return true
+	}
+	virtual_address := u64(address)
+	if virtual_address < higher_half {
+		return false
+	}
+	physical_address := virtual_address - higher_half
+	if physical_address % page_size != 0 {
+		return false
+	}
+
+	first_page := physical_address / page_size
+	page_count := lib.div_roundup(size, page_size)
+	if first_page >= pmm_avl_page_count || page_count > pmm_avl_page_count - first_page {
+		return false
+	}
+
+	pmm_lock.acquire()
+	defer {
+		pmm_lock.release()
+	}
+	for page := first_page; page < first_page + page_count; page++ {
+		if !lib.bittest(pmm_bitmap, page) {
+			return false
+		}
+	}
+
+	unsafe {
+		mut contents := &u64(virtual_address)
+		for i := u64(0); i < (page_count * page_size) / 8; i++ {
+			contents[i] = 0xaaaaaaaaaaaaaaaa
+		}
+	}
+	for page := first_page; page < first_page + page_count; page++ {
+		lib.bitreset(pmm_bitmap, page)
+	}
+	free_pages += page_count
+	return true
+}
+
 pub struct Slab {
 mut:
 	@lock      klock.Lock

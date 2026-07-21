@@ -184,7 +184,7 @@ fn (this TmpFS) populate(node &VFSNode) {}
 
 fn (mut this TmpFS) mount(parent &VFSNode, name string, source &VFSNode) ?&VFSNode {
 	this.dev_id = resource.create_dev_id()
-	return this.create(parent, name, 0o644 | stat.ifdir)
+	return this.create(parent, name, 0o755 | stat.ifdir)
 }
 
 fn (mut this TmpFS) create(parent &VFSNode, name string, mode u32) &VFSNode {
@@ -251,7 +251,7 @@ fn (mut this TmpFS) symlink(parent &VFSNode, dest string, target string) &VFSNod
 
 	new_node.resource = new_resource
 
-	new_node.symlink_target = dest
+	new_node.symlink_target = dest.clone()
 
 	return new_node
 }

@@ -191,7 +191,7 @@ fn (mut this DevTmpFS) mount(parent &VFSNode, name string, source &VFSNode) ?&VF
 	}
 	if unsafe { devtmpfs_root == 0 } {
 		// XXX this will break if devtmpfs is mounted more than once
-		devtmpfs_root = this.create(parent, name, 0o644 | stat.ifdir)
+		devtmpfs_root = this.create(parent, name, 0o755 | stat.ifdir)
 	}
 	return devtmpfs_root
 }
@@ -261,7 +261,7 @@ fn (mut this DevTmpFS) symlink(parent &VFSNode, dest string, target string) &VFS
 
 	new_node.resource = new_resource
 
-	new_node.symlink_target = dest
+	new_node.symlink_target = dest.clone()
 
 	return new_node
 }

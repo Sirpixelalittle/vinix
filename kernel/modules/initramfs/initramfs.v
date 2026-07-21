@@ -5,7 +5,7 @@ import lib
 import limine
 import fs
 import stat
-import memory as _
+import memory
 
 struct USTARHeader {
 	name       [100]u8
@@ -227,4 +227,9 @@ pub fn initialise() {
 	uart_puts('initramfs: Done (')
 	uart_put_dec(entry_count)
 	uart_puts(' entries)\n')
+	if memory.release_bootloader_range(initramfs_begin, initramfs_size) {
+		uart_puts('initramfs: Released archive pages\n')
+	} else {
+		uart_puts('initramfs: Unable to release archive pages\n')
+	}
 }

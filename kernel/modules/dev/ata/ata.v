@@ -5,6 +5,7 @@ import stat
 import klock
 import memory
 import resource
+import block.partition
 import fs
 import x86.kio
 import lib
@@ -72,9 +73,10 @@ pub fn initialise() {
 	// Probe ports and add devices.
 	mut index := 0
 	for i in 0 .. ata_ports.len {
-		drive := init_ata_drive(i, mut dev) or { continue }
+		mut drive := init_ata_drive(i, mut dev) or { continue }
 		name := 'ata${index}'
 		fs.devtmpfs_add_device(drive, name)
+		partition.scan_partitions(mut drive, '${name}p')
 		print('ata: Port ${i} initialised as ${name} (${drive.stat.size} bytes)\n')
 		index += 1
 	}

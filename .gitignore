@@ -7,6 +7,7 @@
 /sysroot
 /iso_root
 /vinix.iso
+/vinix.img
 /initramfs.tar
 /.vscode
 /.jinx-cache

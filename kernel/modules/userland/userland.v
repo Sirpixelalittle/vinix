@@ -282,7 +282,7 @@ pub fn syscall_sigreturn(syscall_context &cpulocal.GPRState, context &cpulocal.G
 	return syscall_context.rax, syscall_context.rdx
 }
 
-pub fn syscall_sigaction(_ voidptr, signum int, act &proc.SigAction, oldact &proc.SigAction) (u64, u64) {
+pub fn syscall_sigaction(_ voidptr, signum int, act &proc.UserSigAction, oldact &proc.UserSigAction) (u64, u64) {
 	mut current_thread := proc.current_thread()
 	mut process := current_thread.process
 
@@ -300,12 +300,17 @@ pub fn syscall_sigaction(_ voidptr, signum int, act &proc.SigAction, oldact &pro
 
 	if oldact != unsafe { nil } {
 		unsafe {
-			*oldact = t.sigactions[signum]
+			oldact.sa_sigaction = t.sigactions[signum].sa_sigaction
+			oldact.sa_mask = t.sigactions[signum].sa_mask
+			oldact.sa_flags = t.sigactions[signum].sa_flags
 		}
 	}
 
 	if act != unsafe { nil } {
-		t.sigactions[signum] = *act
+		t.sigactions[signum].sa_sigaction = act.sa_sigaction
+		t.sigactions[signum].sa_mask = act.sa_mask
+		t.sigactions[signum].sa_flags = act.sa_flags
+		t.sigactions[signum].sa_restorer = unsafe { nil }
 	}
 
 	return 0, 0

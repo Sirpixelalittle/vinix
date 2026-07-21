@@ -186,8 +186,8 @@ pub fn syscall_sigreturn(gpr_state_ptr voidptr, context_arg voidptr, old_mask_ar
 	for {}
 }
 
-pub fn syscall_sigaction(_ voidptr, signum int, act &proc.SigAction, oldact &proc.SigAction) (u64, u64) {
-	if signum < 0 || signum > 34 || signum == sigkill || signum == sigstop {
+pub fn syscall_sigaction(_ voidptr, signum int, act &proc.UserSigAction, oldact &proc.UserSigAction) (u64, u64) {
+	if signum <= 0 || signum > 34 || signum == sigkill || signum == sigstop {
 		return errno.err, errno.einval
 	}
 
@@ -195,12 +195,17 @@ pub fn syscall_sigaction(_ voidptr, signum int, act &proc.SigAction, oldact &pro
 
 	if oldact != unsafe { nil } {
 		unsafe {
-			*oldact = t.sigactions[signum]
+			oldact.sa_sigaction = t.sigactions[signum].sa_sigaction
+			oldact.sa_mask = t.sigactions[signum].sa_mask
+			oldact.sa_flags = t.sigactions[signum].sa_flags
 		}
 	}
 
 	if act != unsafe { nil } {
-		t.sigactions[signum] = *act
+		t.sigactions[signum].sa_sigaction = act.sa_sigaction
+		t.sigactions[signum].sa_mask = act.sa_mask
+		t.sigactions[signum].sa_flags = act.sa_flags
+		t.sigactions[signum].sa_restorer = unsafe { nil }
 	}
 
 	return 0, 0
