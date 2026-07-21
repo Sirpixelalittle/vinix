@@ -95,16 +95,25 @@ fn addr2range(pagemap &memory.Pagemap, addr u64) ?(&MmapRangeLocal, u64, u64) {
 pub fn delete_pagemap(mut pagemap memory.Pagemap) ? {
 	pagemap.l.acquire()
 
-	mmap_ranges := pagemap.mmap_ranges
+	// Snapshot the range pointers before unmapping. munmap_unlocked() removes
+	// entries from pagemap.mmap_ranges as it goes, so iterating the live array
+	// (or a header copy that shares its buffer) would read shifted/freed slots.
+	mut ranges := []voidptr{cap: pagemap.mmap_ranges.len}
+	for ptr in pagemap.mmap_ranges {
+		ranges << ptr
+	}
 
-	for ptr in mmap_ranges {
+	for ptr in ranges {
 		local_range := unsafe { &MmapRangeLocal(ptr) }
 
 		munmap_unlocked(mut pagemap, voidptr(local_range.base), local_range.length) or {}
 	}
 
+	// `ranges` and `pagemap.mmap_ranges` are distinct buffers, so freeing both
+	// is safe — freeing the old `mmap_ranges` header copy alongside
+	// pagemap.mmap_ranges double-freed the same allocation.
 	unsafe {
-		mmap_ranges.free()
+		ranges.free()
 		pagemap.mmap_ranges.free()
 		free(pagemap)
 	}
