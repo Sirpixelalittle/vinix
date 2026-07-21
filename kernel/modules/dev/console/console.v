@@ -45,6 +45,7 @@ __global (
 	console_ctrl_active            = bool(false)
 	console_alt_active             = bool(false)
 	console_extra_scancodes        = bool(false)
+	console_keyboard_grabbed       = bool(false)
 	console_buffer                 [console_buffer_size]u8
 	console_buffer_i               = u64(0)
 	console_bigbuf                 [console_bigbuf_size]u8
@@ -172,6 +173,15 @@ fn add_to_buf(ptr &u8, count u64, echo bool) {
 	event.trigger(mut console_event, false)
 }
 
+fn reset_keyboard_translation_state() {
+	console_numlock_active = false
+	console_capslock_active = false
+	console_shift_active = false
+	console_ctrl_active = false
+	console_alt_active = false
+	console_extra_scancodes = false
+}
+
 fn keyboard_handler() {
 	vect := idt.allocate_vector()
 
@@ -230,13 +240,22 @@ fn keyboard_handler() {
 		event.await(mut events, true) or {}
 		unsafe { events.free() }
 		input_byte := read_ps2()
-		keyboard.submit_scancode(input_byte)
+		keyboard_grabbed := keyboard.submit_scancode(input_byte)
 
-		// A raw keyboard consumer such as Xorg owns input while the device is
-		// open. Keep the console translator from duplicating those keystrokes
-		// into the shell that launched the display server.
-		if keyboard.is_grabbed() {
+		// An explicit raw-input grab, rather than the device's open count, owns
+		// routing while Xorg is active.
+		if keyboard_grabbed {
+			if !console_keyboard_grabbed {
+				reset_keyboard_translation_state()
+				console_keyboard_grabbed = true
+			}
 			continue
+		}
+		if console_keyboard_grabbed {
+			// Modifier releases consumed by X must not leave the console's
+			// translator with stale state when control returns.
+			reset_keyboard_translation_state()
+			console_keyboard_grabbed = false
 		}
 
 		if input_byte == 0xe0 {

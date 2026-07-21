@@ -6,6 +6,10 @@ pub const fionread = 0x541b
 
 pub const fionbio = 0x5421
 
+// Linux-compatible exclusive input-device grab. The argument is interpreted
+// as a boolean value: non-zero acquires the grab and zero releases it.
+pub const eviocgrab = 0x40044590
+
 pub const ioc_nrbits = 8
 pub const ioc_typebits = 8
 pub const ioc_sizebits = 14

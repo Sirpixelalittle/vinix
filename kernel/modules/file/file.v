@@ -34,6 +34,10 @@ pub mut:
 	resource      &resource.Resource = unsafe { nil }
 	node          voidptr
 	refcount      int
+	// Number of installed descriptors which share this open file description.
+	// Unlike refcount, this excludes temporary kernel references obtained while
+	// servicing a syscall.
+	descriptor_refcount int = 1
 	loc           i64
 	flags         int
 	dirlist_valid bool
@@ -256,7 +260,13 @@ pub fn fdnum_close(_process &proc.Process, fdnum int, do_lock bool) ? {
 	mut handle := fd.handle
 	mut res := handle.resource
 
-	res.unref(voidptr(handle))?
+	// Drop the descriptor reference before notifying the resource so devices
+	// can reliably detect the final close of a shared open file description.
+	katomic.dec(mut &handle.descriptor_refcount)
+	res.unref(voidptr(handle)) or {
+		katomic.inc(mut &handle.descriptor_refcount)
+		return none
+	}
 
 	handle.refcount--
 	if handle.refcount == 0 {
@@ -381,6 +391,7 @@ pub fn fdnum_dup(_old_process &proc.Process, oldfdnum int, _new_process &proc.Pr
 	}
 
 	oldfd.handle.refcount++
+	katomic.inc(mut &oldfd.handle.descriptor_refcount)
 	oldfd.handle.resource.refcount++
 
 	return new_fdnum

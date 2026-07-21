@@ -6,6 +6,7 @@ import event
 import event.eventstruct
 import file
 import fs
+import ioctl
 import katomic
 import klock
 import resource
@@ -26,6 +27,7 @@ mut:
 	read_ptr  u64
 	write_ptr u64
 	used      u64
+	grab_owner voidptr
 }
 
 __global (
@@ -39,7 +41,11 @@ pub fn initialise_device() {
 	fs.devtmpfs_add_device(&keyboard_device, 'keyboard')
 }
 
-pub fn submit_scancode(scancode u8) {
+// Queue one raw scancode and return whether an exclusive raw-input owner held
+// the device at the instant the scancode arrived. Returning the routing
+// decision under the same lock as the queue update prevents console/X races
+// during ownership transitions.
+pub fn submit_scancode(scancode u8) bool {
 	keyboard_device.l.acquire()
 
 	// Keep the newest input if a reader stalls long enough to fill the queue.
@@ -52,13 +58,20 @@ pub fn submit_scancode(scancode u8) {
 	keyboard_device.write_ptr = (keyboard_device.write_ptr + 1) % scancode_queue_size
 	keyboard_device.used++
 	keyboard_device.status |= file.pollin
+	grabbed := keyboard_device.grab_owner != unsafe { nil }
 
-	keyboard_device.l.release()
 	event.trigger(mut keyboard_device.event, false)
+	keyboard_device.l.release()
+	return grabbed
 }
 
-pub fn is_grabbed() bool {
-	return katomic.load(&keyboard_device.refcount) != 0
+fn (mut this KeyboardDevice) clear_queue_locked() {
+	this.read_ptr = this.write_ptr
+	this.used = 0
+	this.status &= ~file.pollin
+	this.event.@lock.acquire()
+	this.event.pending = 0
+	this.event.@lock.release()
 }
 
 fn (mut this KeyboardDevice) read(_handle voidptr, buf voidptr, loc u64, count u64) ?i64 {
@@ -107,11 +120,63 @@ fn (mut this KeyboardDevice) write(handle voidptr, buf voidptr, loc u64, count u
 }
 
 fn (mut this KeyboardDevice) ioctl(handle voidptr, request u64, argp voidptr) ?int {
-	return resource.default_ioctl(handle, request, argp)
+	if request != ioctl.eviocgrab {
+		return resource.default_ioctl(handle, request, argp)
+	}
+
+	mut file_handle := unsafe { &file.Handle(handle) }
+	if katomic.load(&file_handle.descriptor_refcount) == 0 {
+		errno.set(errno.ebadf)
+		return none
+	}
+
+	acquire := argp != unsafe { nil }
+	this.l.acquire()
+	defer {
+		this.l.release()
+	}
+
+	if acquire {
+		if this.grab_owner != unsafe { nil } && this.grab_owner != handle {
+			errno.set(errno.ebusy)
+			return none
+		}
+		if this.grab_owner == unsafe { nil } {
+			this.clear_queue_locked()
+			this.grab_owner = handle
+		}
+		return 0
+	}
+
+	// Releasing an already released grab is intentionally idempotent because
+	// Xorg may deliver both DEVICE_OFF and DEVICE_CLOSE callbacks.
+	if this.grab_owner == unsafe { nil } {
+		return 0
+	}
+	if this.grab_owner != handle {
+		errno.set(errno.eperm)
+		return none
+	}
+	this.grab_owner = unsafe { nil }
+	this.clear_queue_locked()
+	return 0
 }
 
 fn (mut this KeyboardDevice) unref(handle voidptr) ? {
 	katomic.dec(mut &this.refcount)
+
+	// A grab belongs to an open file description, not to the device node's
+	// aggregate open count. Forked or duplicated descriptors therefore keep the
+	// grab until their shared description's final descriptor is closed.
+	file_handle := unsafe { &file.Handle(handle) }
+	if katomic.load(&file_handle.descriptor_refcount) == 0 {
+		this.l.acquire()
+		if this.grab_owner == handle {
+			this.grab_owner = unsafe { nil }
+			this.clear_queue_locked()
+		}
+		this.l.release()
+	}
 }
 
 fn (mut this KeyboardDevice) link(handle voidptr) ? {
