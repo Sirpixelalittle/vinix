@@ -62,6 +62,8 @@ fn get_next_thread() &proc.Thread {
 }
 
 fn C.userland__dispatch_a_signal(context &cpulocal.GPRState)
+fn C.userland__current_thread_is_terminating() bool
+fn C.userland__terminate_current_thread()
 
 fn scheduler_isr(_ u32, gpr_state &cpulocal.GPRState) {
 	apic.lapic_timer_stop()
@@ -79,6 +81,9 @@ fn scheduler_isr(_ u32, gpr_state &cpulocal.GPRState) {
 
 		if unsafe { next_thread == nil } && current_thread.is_in_queue {
 			apic.lapic_eoi()
+			if gpr_state.cs == user_code_seg && C.userland__current_thread_is_terminating() {
+				C.userland__terminate_current_thread()
+			}
 			apic.lapic_timer_oneshot(mut cpu_local, scheduler_vector, current_thread.timeslice)
 			return
 		}
@@ -128,6 +133,9 @@ fn scheduler_isr(_ u32, gpr_state &cpulocal.GPRState) {
 	new_gpr_state := &current_thread.gpr_state
 
 	if new_gpr_state.cs == user_code_seg {
+		if C.userland__current_thread_is_terminating() {
+			C.userland__terminate_current_thread()
+		}
 		C.userland__dispatch_a_signal(new_gpr_state)
 	}
 

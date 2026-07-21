@@ -783,10 +783,38 @@ pub fn syscall_waitpid(_ voidptr, pid int, _status &int, options int) (u64, u64)
 	return u64(ret), 0
 }
 
+@[markused]
+pub fn current_thread_is_terminating() bool {
+	current_thread := proc.current_thread()
+	return katomic.load(&current_thread.terminating)
+}
+
+// Complete a sibling's cooperative exit after its active syscall has unwound.
+// Switch to the kernel pagemap before waking the process leader so it cannot
+// tear down a CR3 that this CPU is still using.
+@[markused; noreturn]
+pub fn terminate_current_thread() {
+	mut current_thread := proc.current_thread()
+	kernel_pagemap.switch_to()
+	current_thread.process = kernel_process
+	sched.dequeue_thread(current_thread)
+	event.trigger(mut &current_thread.exited, false)
+	sched.yield(false)
+	for {}
+}
+
 @[noreturn]
 pub fn syscall_exit(_ voidptr, status int) {
 	mut current_thread := proc.current_thread()
 	mut current_process := current_thread.process
+
+	// exit() terminates the whole process, not just its calling thread. Only
+	// one thread performs process teardown; concurrent callers stop after
+	// unwinding their own syscall state.
+	if !katomic.cas[bool](mut &current_process.exiting, false, true) {
+		katomic.store(mut &current_thread.terminating, true)
+		terminate_current_thread()
+	}
 
 	C.printf(c'\n\e[32m%s\e[m: exit(%d)\n', current_process.name.str, status)
 	defer {
@@ -794,6 +822,30 @@ pub fn syscall_exit(_ voidptr, status int) {
 	}
 
 	disarm_itimer_real(current_process)
+
+	mut siblings := []&proc.Thread{}
+	defer {
+		unsafe { siblings.free() }
+	}
+	for sibling_entry in current_process.threads {
+		mut sibling := unsafe { sibling_entry }
+		if voidptr(sibling) == voidptr(current_thread) {
+			continue
+		}
+		katomic.store(mut &sibling.terminating, true)
+		siblings << sibling
+	}
+
+	// Wake blocked syscalls. Each sibling unwinds its event listeners and other
+	// syscall-local state, then terminate_current_thread() signals exited.
+	for sibling in siblings {
+		sched.enqueue_thread(sibling, true)
+	}
+	for sibling in siblings {
+		mut events := [&sibling.exited]
+		event.await(mut events, true) or {}
+		unsafe { events.free() }
+	}
 
 	mut old_pagemap := current_process.pagemap
 

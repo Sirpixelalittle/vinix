@@ -38,6 +38,7 @@ pub mut:
 	sigsuspend_restore bool
 	signal_event       eventstruct.Event
 	enqueued_by_signal bool
+	terminating        bool
 	stacks             []voidptr
 	signalfds_lock     klock.Lock
 	signalfds          []voidptr

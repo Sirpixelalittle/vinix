@@ -29,6 +29,7 @@ pub mut:
 	name                     string
 	itimer_real_value_us     i64
 	itimer_real_interval_us  i64
+	exiting                  bool
 }
 
 pub struct SigAction {
