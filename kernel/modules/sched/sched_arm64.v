@@ -554,6 +554,7 @@ pub fn new_process(old_process &proc.Process, pagemap &memory.Pagemap) ?&proc.Pr
 		new_proc.thread_stack_top = old_process.thread_stack_top
 		new_proc.mmap_anon_non_fixed_base = old_process.mmap_anon_non_fixed_base
 		new_proc.current_directory = old_process.current_directory
+		new_proc.controlling_terminal = old_process.controlling_terminal
 	} else {
 		new_proc.ppid = 0
 		new_proc.pgid = new_proc.pid

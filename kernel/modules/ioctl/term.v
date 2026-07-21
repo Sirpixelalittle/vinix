@@ -16,6 +16,12 @@ pub const tiocspgrp = 0x5410
 
 pub const tiocgwinsz = 0x5413
 
+pub const tiocswinsz = 0x5414
+
+pub const tiocgptn = u64(0x80045430)
+
+pub const tiocsptlck = u64(0x40045431)
+
 pub struct WinSize {
 pub mut:
 	ws_row    u16

@@ -432,7 +432,12 @@ pub fn internal_create(parent &VFSNode, name string, mode u32) ?&VFSNode {
 
 fn fdnum_create_from_node(mut node VFSNode, flags int, oldfd int, specific bool) ?int {
 	current_process := proc.current_thread().process
-	mut fd := file.fd_create_from_resource(mut node.resource, flags) or { return none }
+	mut opened_resource := node.resource
+	mut device := node.resource
+	if mut device is resource.CloneDevice {
+		opened_resource = device.open(flags) or { return none }
+	}
+	mut fd := file.fd_create_from_resource(mut opened_resource, flags) or { return none }
 	fd.handle.node = voidptr(node)
 	return file.fdnum_create_from_fd(current_process, fd, oldfd, specific)
 }
@@ -696,6 +701,17 @@ pub fn syscall_openat(_ voidptr, dirfd int, _path charptr, flags int, mode u32) 
 		return errno.err, errno.enoent
 	}
 
+	if path == '/dev/tty' {
+		if process.controlling_terminal == unsafe { nil } {
+			return errno.err, errno.enxio
+		}
+		mut terminal := unsafe { &VFSNode(process.controlling_terminal) }
+		fdnum := fdnum_create_from_node(mut terminal, flags, 0, false) or {
+			return errno.err, errno.get()
+		}
+		return u64(fdnum), 0
+	}
+
 	parent := get_parent_dir(dirfd, path) or { return errno.err, errno.get() }
 
 	creat_flags := flags & resource.file_creation_flags_mask
@@ -728,7 +744,69 @@ pub fn syscall_openat(_ voidptr, dirfd int, _path charptr, flags int, mode u32) 
 
 	fdnum := fdnum_create_from_node(mut node, flags, 0, false) or { return errno.err, errno.get() }
 
+	mut opened_device := node.resource
+	if opened_device is resource.TerminalDevice {
+		if flags & resource.o_noctty == 0 && process.pid == process.sid
+			&& process.controlling_terminal == unsafe { nil } {
+			process.controlling_terminal = voidptr(node)
+		}
+	}
+
 	return u64(fdnum), 0
+}
+
+pub fn syscall_fchownat(_ voidptr, dirfd int, _path charptr, owner u32, group u32, flags int) (u64, u64) {
+	mut process := proc.current_thread().process
+	path := unsafe { cstring_to_vstring(_path) }
+	mut target := &resource.Resource(unsafe { nil })
+
+	if path.len == 0 {
+		if flags & at_empty_path == 0 {
+			return errno.err, errno.enoent
+		}
+		mut fd := file.fd_from_fdnum(process, dirfd) or { return errno.err, errno.get() }
+		defer {
+			fd.unref()
+		}
+		target = fd.handle.resource
+	} else {
+		parent := get_parent_dir(dirfd, path) or { return errno.err, errno.get() }
+		follow_links := flags & at_symlink_nofollow == 0
+		node := get_node(parent, path, follow_links) or { return errno.err, errno.get() }
+		target = node.resource
+	}
+
+	if owner != ~u32(0) {
+		target.stat.uid = owner
+	}
+	if group != ~u32(0) {
+		target.stat.gid = group
+	}
+	return 0, 0
+}
+
+pub fn syscall_fchmodat(_ voidptr, dirfd int, _path charptr, mode u32, flags int) (u64, u64) {
+	mut process := proc.current_thread().process
+	path := unsafe { cstring_to_vstring(_path) }
+	mut target := &resource.Resource(unsafe { nil })
+
+	if path.len == 0 {
+		if flags & at_empty_path == 0 {
+			return errno.err, errno.enoent
+		}
+		mut fd := file.fd_from_fdnum(process, dirfd) or { return errno.err, errno.get() }
+		defer {
+			fd.unref()
+		}
+		target = fd.handle.resource
+	} else {
+		parent := get_parent_dir(dirfd, path) or { return errno.err, errno.get() }
+		node := get_node(parent, path, true) or { return errno.err, errno.get() }
+		target = node.resource
+	}
+
+	target.stat.mode = (target.stat.mode & stat.ifmt) | (mode & ~u32(stat.ifmt))
+	return 0, 0
 }
 
 pub fn syscall_read(_ voidptr, fdnum int, buf voidptr, count u64) (u64, u64) {

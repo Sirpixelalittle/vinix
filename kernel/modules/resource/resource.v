@@ -50,6 +50,22 @@ mut:
 	mmap(page u64, flags int) voidptr
 }
 
+// CloneDevice is implemented by device nodes, such as /dev/ptmx, whose open
+// operation must return a fresh resource rather than another handle to the
+// node's shared resource.
+pub interface CloneDevice {
+	Resource
+mut:
+	open(flags int) ?&Resource
+}
+
+// TerminalDevice marks character devices that can become a session's
+// controlling terminal when opened without O_NOCTTY.
+pub interface TerminalDevice {
+	Resource
+	is_terminal() bool
+}
+
 __global (
 	dev_id_counter = u64(1)
 )

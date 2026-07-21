@@ -24,6 +24,7 @@ pub mut:
 	children                 []&Process
 	mmap_anon_non_fixed_base u64
 	current_directory        voidptr
+	controlling_terminal     voidptr
 	event                    eventstruct.Event
 	status                   int
 	name                     string

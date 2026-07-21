@@ -252,6 +252,10 @@ pub mut:
 	termios termios.Termios
 }
 
+fn (this Console) is_terminal() bool {
+	return true
+}
+
 fn (mut this Console) mmap(page u64, flags int) voidptr {
 	return 0
 }

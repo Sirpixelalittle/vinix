@@ -228,6 +228,17 @@ pub fn syscall_setpgid(_ voidptr, pid int, pgid int) (u64, u64) {
 	return 0, 0
 }
 
+pub fn syscall_setsid(_ voidptr) (u64, u64) {
+	mut process := proc.current_thread().process
+	if process.pgid == process.pid {
+		return errno.err, errno.eperm
+	}
+	process.sid = process.pid
+	process.pgid = process.pid
+	process.controlling_terminal = unsafe { nil }
+	return u64(process.sid), 0
+}
+
 pub fn syscall_getgroups(_ voidptr, size int, list &u32) (u64, u64) {
 	mut current_thread := proc.current_thread()
 	mut process := current_thread.process

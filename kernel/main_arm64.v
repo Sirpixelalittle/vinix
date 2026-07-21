@@ -31,6 +31,7 @@ import dev.console
 import dev.fbdev
 import dev.fbdev.simple
 import dev.streams
+import dev.pty
 import time
 import userland
 
@@ -157,6 +158,7 @@ fn kmain_thread() {
 	exception.register_segfault_handler(segfault_kill_process)
 
 	streams.initialise()
+	pty.initialise()
 	print('kmain_thread: streams done\n')
 
 	fbdev.initialise()

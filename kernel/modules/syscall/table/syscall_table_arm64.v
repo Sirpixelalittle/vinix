@@ -315,11 +315,6 @@ fn syscall_linux_flock(_ voidptr, fd int, operation int) (u64, u64) {
 	return 0, 0
 }
 
-// fchmodat: stub — return success (permissions are ignored on tmpfs).
-fn syscall_linux_fchmodat(_ voidptr, dirfd int, path charptr, mode u32, flags int) (u64, u64) {
-	return 0, 0
-}
-
 // ── X11 / dynamic-linking syscall stubs ──
 
 // ftruncate: stub — pretend success (mostly used for tmpfiles).
@@ -431,16 +426,6 @@ fn syscall_linux_getitimer(_ voidptr, which int, curr_value u64) (u64, u64) {
 	}
 
 	return 0, 0
-}
-
-// setpgid / getpgid: stubs — process groups not fully implemented.
-fn syscall_linux_setpgid(_ voidptr, pid int, pgid int) (u64, u64) {
-	return 0, 0
-}
-
-fn syscall_linux_getpgid(_ voidptr, pid int) (u64, u64) {
-	current := proc.current_thread()
-	return u64(current.process.pid), 0
 }
 
 // prctl: stub — return success for most operations.
@@ -822,7 +807,8 @@ pub fn init_syscall_table() {
 	syscall_table[48] = voidptr(fs.syscall_faccessat) // __NR_faccessat
 	syscall_table[49] = voidptr(fs.syscall_chdir) // __NR_chdir
 	syscall_table[52] = voidptr(fs.syscall_fchmod) // __NR_fchmod
-	syscall_table[53] = voidptr(syscall_linux_fchmodat) // __NR_fchmodat
+	syscall_table[53] = voidptr(fs.syscall_fchmodat) // __NR_fchmodat
+	syscall_table[54] = voidptr(fs.syscall_fchownat) // __NR_fchownat
 	syscall_table[56] = voidptr(fs.syscall_openat) // __NR_openat
 	syscall_table[57] = voidptr(fs.syscall_close) // __NR_close
 	syscall_table[59] = voidptr(pipe.syscall_pipe) // __NR_pipe2
@@ -885,8 +871,9 @@ pub fn init_syscall_table() {
 	syscall_table[88] = voidptr(syscall_linux_utimensat) // __NR_utimensat
 	syscall_table[103] = voidptr(syscall_linux_setitimer) // __NR_setitimer
 	syscall_table[104] = voidptr(syscall_linux_getitimer) // __NR_getitimer
-	syscall_table[154] = voidptr(syscall_linux_setpgid) // __NR_setpgid
-	syscall_table[155] = voidptr(syscall_linux_getpgid) // __NR_getpgid
+	syscall_table[154] = voidptr(userland.syscall_setpgid) // __NR_setpgid
+	syscall_table[155] = voidptr(userland.syscall_getpgid) // __NR_getpgid
+	syscall_table[157] = voidptr(userland.syscall_setsid) // __NR_setsid
 	syscall_table[165] = voidptr(syscall_linux_getrusage) // __NR_getrusage
 	syscall_table[167] = voidptr(syscall_linux_prctl) // __NR_prctl
 	syscall_table[38] = voidptr(syscall_linux_renameat) // __NR_renameat
