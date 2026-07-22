@@ -35,6 +35,7 @@ pub mut:
 	redir          &VFSNode           = unsafe { nil }
 	resource       &resource.Resource = unsafe { nil }
 	filesystem     &FileSystem        = unsafe { nil }
+	populate_lock  klock.Lock
 	name           string
 	parent         &VFSNode             = unsafe { nil }
 	children       &map[string]&VFSNode = unsafe { nil }
@@ -99,6 +100,19 @@ fn reduce_node(node &VFSNode, follow_symlinks bool) &VFSNode {
 
 fn ensure_populated(mut node VFSNode) {
 	if unsafe { node == nil } || node.populated || !stat.isdir(node.resource.stat.mode) {
+		return
+	}
+
+	// Path lookup can reach an unpopulated directory concurrently (most
+	// visibly when init starts the login shells for all virtual terminals).
+	// populate() mutates the shared children map, so exactly one CPU may build
+	// it. Recheck after acquiring the node lock because another CPU may have
+	// completed the work while we were waiting.
+	node.populate_lock.acquire()
+	defer {
+		node.populate_lock.release()
+	}
+	if node.populated {
 		return
 	}
 	node.filesystem.populate(node)
