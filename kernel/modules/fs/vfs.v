@@ -160,6 +160,29 @@ fn path2node(parent &VFSNode, path string) (&VFSNode, &VFSNode, string) {
 		elem_str := unsafe { cstring_to_vstring(&elem[0]) }
 
 		current_node = reduce_node(current_node, false)
+
+		// Dot components are pathname syntax, not ordinary directory entries.
+		// Filesystems such as ext2 do not retain `.` and `..` in the VFS child
+		// map, so resolving them through that map breaks relative symlinks such
+		// as /usr/bin/v -> ../v/v.
+		if elem_str == '.' {
+			if last {
+				return current_node, current_node, elem_str
+			}
+			continue
+		}
+		if elem_str == '..' {
+			mut next_node := current_node
+			if unsafe { current_node.parent != nil } {
+				next_node = reduce_node(current_node.parent, false)
+			}
+			if last {
+				return current_node, next_node, elem_str
+			}
+			current_node = next_node
+			continue
+		}
+
 		ensure_populated(mut current_node)
 
 		if elem_str !in current_node.children {
@@ -339,6 +362,10 @@ pub fn switch_root(parent &VFSNode, target string) ?&VFSNode {
 	old_anchor := vfs_root
 	old_root := reduce_node(old_anchor, false)
 	vfs_root = new_root
+	// A root node has no pathname component of its own. Leaving the staging
+	// mount name here makes pathname() walk through a null parent after adding
+	// `/newroot` to every current working directory.
+	new_root.name = ''
 	new_root.parent = unsafe { nil }
 	if voidptr(old_anchor) != voidptr(old_root) {
 		// The initial root is represented by an empty anchor with the tmpfs
@@ -425,7 +452,7 @@ pub fn pathname(node &VFSNode) string {
 
 	mut current_node := unsafe { node }
 
-	for {
+	for unsafe { current_node != nil } {
 		if current_node.name == '' {
 			break
 		}
