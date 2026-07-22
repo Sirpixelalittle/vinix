@@ -204,9 +204,16 @@ fn (mut this UnixSocket) ioctl(handle voidptr, request u64, argp voidptr) ?int {
 				errno.set(errno.einval)
 				return none
 			}
-			mut retp := unsafe { &u64(argp) }
+			if argp == unsafe { nil } {
+				errno.set(errno.efault)
+				return none
+			}
+			// FIONREAD's userspace ABI returns an int.  Writing a u64 here
+			// overwrites four bytes beyond the caller's object; xterm keeps
+			// that object immediately below a saved frame pointer.
+			mut retp := unsafe { &int(argp) }
 			unsafe {
-				*retp = this.used
+				*retp = int(this.used)
 			}
 			return 0
 		}

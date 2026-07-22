@@ -110,11 +110,12 @@ fn scheduler_isr(_ u32, gpr_state &cpulocal.GPRState) {
 	current_thread = next_thread
 
 	cpu.set_gs_base(u64(current_thread))
-	if current_thread.gpr_state.cs == 0x43 {
-		cpu.set_kernel_gs_base(current_thread.gs_base)
-	} else {
-		cpu.set_kernel_gs_base(u64(current_thread))
-	}
+	// While the kernel is running, GS identifies the current thread and
+	// KERNEL_GS_BASE retains the value that must be restored to userspace by
+	// swapgs.  This is also true when resuming a thread that was preempted in
+	// the kernel; replacing KERNEL_GS_BASE with the thread pointer there loses
+	// the userspace GS base.
+	cpu.set_kernel_gs_base(current_thread.gs_base)
 	cpu.set_fs_base(current_thread.fs_base)
 
 	cpu_local.tss.ist3 = current_thread.pf_stack
@@ -137,8 +138,40 @@ fn scheduler_isr(_ u32, gpr_state &cpulocal.GPRState) {
 			C.userland__terminate_current_thread()
 		}
 		C.userland__dispatch_a_signal(new_gpr_state)
+
+		asm volatile amd64 {
+			mov rsp, new_gpr_state
+			pop rax
+			mov ds, eax
+			pop rax
+			mov es, eax
+			pop rax
+			pop rbx
+			pop rcx
+			pop rdx
+			pop rsi
+			pop rdi
+			pop rbp
+			pop r8
+			pop r9
+			pop r10
+			pop r11
+			pop r12
+			pop r13
+			pop r14
+			pop r15
+			add rsp, 8
+			swapgs
+			iretq
+			; ; rm (new_gpr_state)
+			; memory
+		}
 	}
 
+	// Scheduler interrupts use an IST stack, so their saved frame includes
+	// RSP and SS even when the interrupted context was already in the kernel.
+	// Restore that complete frame directly, but do not swap GS: kernel code
+	// must resume with GS still pointing at the current Thread.
 	asm volatile amd64 {
 		mov rsp, new_gpr_state
 		pop rax
@@ -161,7 +194,6 @@ fn scheduler_isr(_ u32, gpr_state &cpulocal.GPRState) {
 		pop r14
 		pop r15
 		add rsp, 8
-		swapgs
 		iretq
 		; ; rm (new_gpr_state)
 		; memory
@@ -357,7 +389,7 @@ pub fn syscall_new_thread(_ voidptr, pc voidptr, stack u64) (u64, u64) {
 
 	enqueue_thread(new_thread, false)
 
-	return u64(new_thread.tid), 0
+	return u64(new_thread.tid + 1), 0
 }
 
 pub fn new_user_thread(_process &proc.Process, want_elf bool, pc voidptr, arg voidptr, _stack u64, argv []string, envp []string, auxval &elf.Auxval, autoenqueue bool) ?&proc.Thread {

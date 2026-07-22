@@ -910,13 +910,16 @@ pub fn syscall_fork(gpr_state &cpulocal.GPRState) (u64, u64) {
 
 	new_process.name = '${old_process.name}[${new_process.pid}]'
 
-	// Dup all FDs
+	// Dup all FDs, preserving O_CLOEXEC flags.
 	for i := 0; i < proc.max_fds; i++ {
 		if old_process.fds[i] == unsafe { nil } {
 			continue
 		}
 
-		file.fdnum_dup(old_process, i, new_process, i, 0, true, false) or { panic('') }
+		old_fd := unsafe { &file.FD(old_process.fds[i]) }
+		file.fdnum_dup(old_process, i, new_process, i, old_fd.flags, true, false) or {
+			panic('')
+		}
 	}
 
 	stack_size := u64(0x200000)
@@ -1014,36 +1017,21 @@ pub fn start_program(execve bool, dir &fs.VFSNode, path string, argv []string, e
 		new_process.name = '${path}[${new_process.pid}]'
 
 		stdin_node := fs.get_node(vfs_root, stdin, true)?
-		stdin_handle := &file.Handle{
-			resource: stdin_node.resource
-			node:     stdin_node
-			refcount: 1
-		}
-		stdin_fd := &file.FD{
-			handle: stdin_handle
-		}
+		mut stdin_resource := stdin_node.resource
+		mut stdin_fd := file.fd_create_from_resource(mut stdin_resource, 0)?
+		stdin_fd.handle.node = voidptr(stdin_node)
 		new_process.fds[0] = voidptr(stdin_fd)
 
 		stdout_node := fs.get_node(vfs_root, stdout, true)?
-		stdout_handle := &file.Handle{
-			resource: stdout_node.resource
-			node:     stdout_node
-			refcount: 1
-		}
-		stdout_fd := &file.FD{
-			handle: stdout_handle
-		}
+		mut stdout_resource := stdout_node.resource
+		mut stdout_fd := file.fd_create_from_resource(mut stdout_resource, 0)?
+		stdout_fd.handle.node = voidptr(stdout_node)
 		new_process.fds[1] = voidptr(stdout_fd)
 
 		stderr_node := fs.get_node(vfs_root, stderr, true)?
-		stderr_handle := &file.Handle{
-			resource: stderr_node.resource
-			node:     stderr_node
-			refcount: 1
-		}
-		stderr_fd := &file.FD{
-			handle: stderr_handle
-		}
+		mut stderr_resource := stderr_node.resource
+		mut stderr_fd := file.fd_create_from_resource(mut stderr_resource, 0)?
+		stderr_fd.handle.node = voidptr(stderr_node)
 		new_process.fds[2] = voidptr(stderr_fd)
 
 		sched.new_user_thread(new_process, true, entry_point, unsafe { nil }, 0, argv,

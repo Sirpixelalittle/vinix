@@ -34,9 +34,9 @@ pub mut:
 	resource      &resource.Resource = unsafe { nil }
 	node          voidptr
 	refcount      int
-	// Number of installed descriptors which share this open file description.
-	// Unlike refcount, this excludes temporary kernel references obtained while
-	// servicing a syscall.
+	// Number of live descriptor objects which share this open file description.
+	// Unlike refcount, this excludes temporary kernel references and reaches zero
+	// before the resource receives its final unref callback.
 	descriptor_refcount int = 1
 	loc           i64
 	flags         int
@@ -221,12 +221,29 @@ pub fn (mut this Handle) ioctl(request u64, argp voidptr) ?int {
 
 pub struct FD {
 pub mut:
-	handle &Handle = unsafe { nil }
-	flags  int
+	refcount int = 1
+	handle   &Handle = unsafe { nil }
+	flags    int
 }
 
 pub fn (mut this FD) unref() {
-	this.handle.refcount--
+	if katomic.dec(mut &this.refcount) {
+		return
+	}
+
+	mut handle := this.handle
+	mut res := handle.resource
+
+	// The descriptor object remains alive after close while a syscall is still
+	// using it. Finalise the open-file references only after the last such user
+	// has dropped its FD reference.
+	katomic.dec(mut &handle.descriptor_refcount)
+	res.unref(voidptr(handle)) or {}
+
+	if !katomic.dec(mut &handle.refcount) {
+		unsafe { free(voidptr(handle)) }
+	}
+	unsafe { free(voidptr(this)) }
 }
 
 pub fn fdnum_close(_process &proc.Process, fdnum int, do_lock bool) ? {
@@ -257,25 +274,11 @@ pub fn fdnum_close(_process &proc.Process, fdnum int, do_lock bool) ? {
 		return none
 	}
 
-	mut handle := fd.handle
-	mut res := handle.resource
-
-	// Drop the descriptor reference before notifying the resource so devices
-	// can reliably detect the final close of a shared open file description.
-	katomic.dec(mut &handle.descriptor_refcount)
-	res.unref(voidptr(handle)) or {
-		katomic.inc(mut &handle.descriptor_refcount)
-		return none
-	}
-
-	handle.refcount--
-	if handle.refcount == 0 {
-		unsafe { free(voidptr(handle)) }
-	}
-
-	unsafe { free(voidptr(fd)) }
-
+	// Remove the descriptor from the table before dropping its installed
+	// reference. Concurrent syscalls which already acquired the FD keep the
+	// descriptor, handle and resource alive until they finish.
 	process.fds[fdnum] = unsafe { nil }
+	fd.unref()
 }
 
 pub fn fdnum_create_from_fd(_process &proc.Process, fd &FD, oldfd int, specific bool) ?int {
@@ -322,8 +325,11 @@ pub fn fd_create_from_resource(mut res resource.Resource, flags int) ?&FD {
 }
 
 pub fn fdnum_create_from_resource(_process &proc.Process, mut res resource.Resource, flags int, oldfd int, specific bool) ?int {
-	new_fd := fd_create_from_resource(mut res, flags) or { return none }
-	return fdnum_create_from_fd(_process, new_fd, oldfd, specific)
+	mut new_fd := fd_create_from_resource(mut res, flags) or { return none }
+	return fdnum_create_from_fd(_process, new_fd, oldfd, specific) or {
+		new_fd.unref()
+		return none
+	}
 }
 
 pub fn fd_from_fdnum(_process &proc.Process, fdnum int) ?&FD {
@@ -350,7 +356,7 @@ pub fn fd_from_fdnum(_process &proc.Process, fdnum int) ?&FD {
 		return none
 	}
 
-	ret.handle.refcount++
+	katomic.inc(mut &ret.refcount)
 
 	return ret
 }
@@ -376,23 +382,26 @@ pub fn fdnum_dup(_old_process &proc.Process, oldfdnum int, _new_process &proc.Pr
 	}
 
 	mut oldfd := fd_from_fdnum(old_process, oldfdnum) or { return none }
+	defer {
+		oldfd.unref()
+	}
 
-	mut new_fd := unsafe { &FD(malloc(sizeof(FD))) }
-	unsafe { C.memcpy(new_fd, oldfd, sizeof(FD)) }
+	mut new_fd := &FD{
+		handle: oldfd.handle
+		flags:  flags & resource.file_descriptor_flags_mask
+	}
+	if cloexec {
+		new_fd.flags |= resource.o_cloexec
+	}
+
+	katomic.inc(mut &oldfd.handle.refcount)
+	katomic.inc(mut &oldfd.handle.descriptor_refcount)
+	katomic.inc(mut &oldfd.handle.resource.refcount)
 
 	new_fdnum := fdnum_create_from_fd(new_process, new_fd, newfdnum, specific) or {
-		oldfd.unref()
+		new_fd.unref()
 		return none
 	}
-
-	new_fd.flags = flags & resource.file_descriptor_flags_mask
-	if cloexec {
-		new_fd.flags &= resource.o_cloexec
-	}
-
-	oldfd.handle.refcount++
-	katomic.inc(mut &oldfd.handle.descriptor_refcount)
-	oldfd.handle.resource.refcount++
 
 	return new_fdnum
 }
@@ -423,6 +432,9 @@ pub fn syscall_fcntl(_ voidptr, fdnum int, cmd int, arg u64) (u64, u64) {
 	}
 
 	mut fd := fd_from_fdnum(unsafe { nil }, fdnum) or { return errno.err, errno.ebadf }
+	defer {
+		fd.unref()
+	}
 
 	mut handle := fd.handle
 
@@ -439,31 +451,24 @@ pub fn syscall_fcntl(_ voidptr, fdnum int, cmd int, arg u64) (u64, u64) {
 		}
 		f_getfd {
 			ret = if fd.flags & resource.o_cloexec != 0 { u64(fd_cloexec) } else { 0 }
-			fd.unref()
 		}
 		f_setfd {
 			fd.flags = if arg & fd_cloexec != 0 { resource.o_cloexec } else { 0 }
-			fd.unref()
 		}
 		f_getfl {
 			ret = u64(handle.flags)
-			fd.unref()
 		}
 		f_setfl {
 			handle.flags = int(arg)
-			fd.unref()
 		}
 		f_getpipe_sz {
 			if handle.resource.stat.mode & stat.ifmt != stat.ifpipe {
-				fd.unref()
 				return errno.err, errno.einval
 			}
 			ret = u64(handle.resource.stat.size)
-			fd.unref()
 		}
 		f_setpipe_sz {
 			if handle.resource.stat.mode & stat.ifmt != stat.ifpipe {
-				fd.unref()
 				return errno.err, errno.einval
 			}
 			mut new_size := arg
@@ -471,15 +476,12 @@ pub fn syscall_fcntl(_ voidptr, fdnum int, cmd int, arg u64) (u64, u64) {
 				new_size = 4096
 			}
 			handle.resource.grow(voidptr(handle), new_size) or {
-				fd.unref()
 				return errno.err, errno.get()
 			}
 			ret = new_size
-			fd.unref()
 		}
 		else {
 			print('\nfcntl: Unhandled command: ${cmd}\n')
-			fd.unref()
 			return errno.err, errno.einval
 		}
 	}

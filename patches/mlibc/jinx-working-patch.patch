@@ -9,7 +9,14 @@ diff --color -urN --no-dereference '--exclude=.git' mlibc-clean/sysdeps/vinix/ge
  
  #define STUB_ONLY {                             \
  	__ensure(!"STUB_ONLY function was called"); \
-@@ -357,6 +358,29 @@
+@@ -42,0 +44,6 @@
++int sys_futex_tid() {
++	__syscall_ret ret = __syscall(69);
++	__ensure(ret.errno == 0);
++	return static_cast<int>(ret.ret);
++}
++
+@@ -357,6 +364,29 @@
  	return 0;
  }
  

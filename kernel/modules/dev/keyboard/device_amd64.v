@@ -60,8 +60,8 @@ pub fn submit_scancode(scancode u8) bool {
 	keyboard_device.status |= file.pollin
 	grabbed := keyboard_device.grab_owner != unsafe { nil }
 
-	event.trigger(mut keyboard_device.event, false)
 	keyboard_device.l.release()
+	event.trigger(mut keyboard_device.event, false)
 	return grabbed
 }
 

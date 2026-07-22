@@ -365,7 +365,7 @@ pub fn syscall_new_thread(_ voidptr, pc voidptr, stack u64) (u64, u64) {
 
 	enqueue_thread(new_thread, false)
 
-	return u64(new_thread.tid), 0
+	return u64(new_thread.tid + 1), 0
 }
 
 pub fn new_user_thread(_process &proc.Process, want_elf bool, pc voidptr, arg voidptr, _stack u64, argv []string, envp []string, auxval &elf.Auxval, autoenqueue bool) ?&proc.Thread {

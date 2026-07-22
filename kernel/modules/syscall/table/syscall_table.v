@@ -16,7 +16,7 @@ import sched
 import errno
 
 __global (
-	syscall_table [69]voidptr
+	syscall_table [70]voidptr
 )
 
 fn syscall_vacant(_ voidptr) (u64, u64) {
@@ -93,4 +93,5 @@ pub fn init_syscall_table() {
 	syscall_table[66] = voidptr(fs.syscall_fchownat)
 	syscall_table[67] = voidptr(userland.syscall_setsid)
 	syscall_table[68] = voidptr(fs.syscall_fchmodat)
+	syscall_table[69] = voidptr(sched.syscall_gettid)
 }
