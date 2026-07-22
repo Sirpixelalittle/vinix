@@ -15,6 +15,7 @@ import fs
 import sched
 import stat
 import dev.console
+import dev.seat
 import userland
 import pipe
 import futex
@@ -171,6 +172,7 @@ fn kmain_thread() {
 	fbdev.initialise()
 	fbdev.register_driver(simple.get_driver())
 	console.initialise()
+	seat.initialise()
 	serial.initialise()
 	mouse.initialise()
 	hda.initialize()

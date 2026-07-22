@@ -7,6 +7,7 @@ import event.eventstruct
 import x86.cpu
 import x86.cpu.local as cpulocal
 import katomic
+import klock
 
 __global (
 	waiting_event_count = u64(0)
@@ -124,6 +125,71 @@ pub fn await(mut events []&eventstruct.Event, block bool) ?u64 {
 	sched.dequeue_thread(t)
 
 	unlock_events(mut events)
+
+	sched.yield(true)
+
+	katomic.dec(mut &waiting_event_count)
+
+	if t.enqueued_by_signal {
+		return none
+	}
+
+	return t.which_event
+}
+
+// await_interlocked is the wait-queue half of an atomic condition check and
+// sleep operation. The caller enters with interlock held. Once the current
+// thread has been attached to every event and removed from the run queue, this
+// function releases interlock before sleeping. This prevents a producer from
+// changing the condition and issuing a wake between the caller's condition
+// check and listener registration.
+//
+// The interlock is released on every return path.
+pub fn await_interlocked(mut events []&eventstruct.Event, block bool, mut interlock klock.Lock) ?u64 {
+	mut t := proc.current_thread()
+
+	asm volatile amd64 {
+		cli
+	}
+	defer {
+		asm volatile amd64 {
+			sti
+		}
+	}
+
+	lock_events(mut events)
+
+	if i := check_for_pending(mut events) {
+		unlock_events(mut events)
+		interlock.release()
+		return i
+	}
+
+	if block == false {
+		unlock_events(mut events)
+		interlock.release()
+		return none
+	}
+
+	katomic.inc(mut &waiting_event_count)
+
+	attach_listeners(mut events, mut t)
+	defer {
+		asm volatile amd64 {
+			cli
+		}
+		lock_events(mut events)
+		detach_listeners(mut t)
+		unlock_events(mut events)
+		asm volatile amd64 {
+			sti
+		}
+	}
+
+	sched.dequeue_thread(t)
+
+	unlock_events(mut events)
+	interlock.release()
 
 	sched.yield(true)
 

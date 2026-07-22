@@ -10,9 +10,13 @@ import event.eventstruct
 import klock
 import katomic
 import errno
+import ioctl
 import x86.kio
 import x86.apic
 import x86.idt
+import dev.seat
+
+const mouse_queue_size = 1024
 
 @[inline]
 fn wait(t int) {
@@ -62,8 +66,21 @@ pub mut:
 	status   int
 	can_mmap bool
 
-	packet_avl bool
-	packet     MousePacket
+	queue      [mouse_queue_size]MousePacket
+	read_ptr   u64
+	write_ptr  u64
+	used       u64
+	lease_owner voidptr
+	lease_token voidptr
+}
+
+fn (mut this Mouse) clear_queue_locked() {
+	this.read_ptr = this.write_ptr
+	this.used = 0
+	this.status &= ~int(file.pollin)
+	this.event.@lock.acquire()
+	this.event.pending = 0
+	this.event.@lock.release()
 }
 
 fn (mut this Mouse) mmap(page u64, flags int) voidptr {
@@ -79,8 +96,18 @@ fn (mut this Mouse) read(_handle voidptr, buf voidptr, loc u64, count u64) ?i64 
 	handle := unsafe { &file.Handle(_handle) }
 
 	mouse_res.l.acquire()
+	if seat.capability_is_leased(ioctl.seat_cap_pointer)
+		|| mouse_res.lease_owner != unsafe { nil } {
+		if mouse_res.lease_owner != _handle
+			|| !seat.attachment_is_active(mouse_res.lease_token,
+				ioctl.seat_cap_pointer) {
+			mouse_res.l.release()
+			errno.set(errno.eacces)
+			return none
+		}
+	}
 
-	for mouse_res.packet_avl == false {
+	for mouse_res.used == 0 {
 		mouse_res.l.release()
 
 		if handle.flags & resource.o_nonblock != 0 {
@@ -96,11 +123,13 @@ fn (mut this Mouse) read(_handle voidptr, buf voidptr, loc u64, count u64) ?i64 
 	}
 
 	unsafe {
-		C.memcpy(buf, &mouse_res.packet, sizeof(MousePacket))
+		C.memcpy(buf, &mouse_res.queue[mouse_res.read_ptr], sizeof(MousePacket))
 	}
-	mouse_res.packet_avl = false
-
-	mouse_res.status &= ~int(file.pollin)
+	mouse_res.read_ptr = (mouse_res.read_ptr + 1) % mouse_queue_size
+	mouse_res.used--
+	if mouse_res.used == 0 {
+		mouse_res.status &= ~int(file.pollin)
+	}
 
 	mouse_res.l.release()
 
@@ -112,11 +141,54 @@ fn (mut this Mouse) write(handle voidptr, buf voidptr, loc u64, count u64) ?i64 
 }
 
 fn (mut this Mouse) ioctl(handle voidptr, request u64, argp voidptr) ?int {
+	if request == ioctl.seat_attach_input {
+		if argp == unsafe { nil } {
+			errno.set(errno.efault)
+			return none
+		}
+		attachment := unsafe { *&ioctl.SeatAttachInput(argp) }
+		token := seat.attach_fd(attachment.lease_fd, ioctl.seat_cap_pointer) or {
+			return none
+		}
+		this.l.acquire()
+		if this.lease_token != unsafe { nil }
+			&& !seat.attachment_is_active(this.lease_token,
+				ioctl.seat_cap_pointer) {
+			seat.detach(this.lease_token)
+			this.lease_token = unsafe { nil }
+			this.lease_owner = unsafe { nil }
+			this.clear_queue_locked()
+		}
+		if this.lease_owner != unsafe { nil } && this.lease_owner != handle {
+			this.l.release()
+			seat.detach(token)
+			errno.set(errno.ebusy)
+			return none
+		}
+		if this.lease_token != unsafe { nil } {
+			seat.detach(this.lease_token)
+		}
+		this.lease_owner = handle
+		this.lease_token = token
+		this.clear_queue_locked()
+		this.l.release()
+		return 0
+	}
 	return resource.default_ioctl(handle, request, argp)
 }
 
 fn (mut this Mouse) unref(handle voidptr) ? {
 	katomic.dec(mut &this.refcount)
+	file_handle := unsafe { &file.Handle(handle) }
+	if katomic.load(&file_handle.descriptor_refcount) == 0 {
+		this.l.acquire()
+		if this.lease_owner == handle {
+			seat.detach(this.lease_token)
+			this.lease_owner = unsafe { nil }
+			this.lease_token = unsafe { nil }
+		}
+		this.l.release()
+	}
 }
 
 fn (mut this Mouse) link(handle voidptr) ? {
@@ -188,13 +260,36 @@ fn handler() {
 			current_packet.y_mov = u32(i8(u8(current_packet.y_mov)))
 		}
 
+		seat.submit_pointer(current_packet.flags, i32(current_packet.x_mov),
+			i32(current_packet.y_mov))
+
 		mouse_res.l.acquire()
-		mouse_res.packet = current_packet
-		mouse_res.packet_avl = true
+		if mouse_res.lease_token != unsafe { nil }
+			&& !seat.attachment_is_active(mouse_res.lease_token,
+				ioctl.seat_cap_pointer) {
+			// Preserve a deny-only binding for the revoked handle. A later
+			// active attachment or close will release the retained lease token.
+			mouse_res.clear_queue_locked()
+			mouse_res.l.release()
+			continue
+		}
+		// Preserve every button transition and movement packet. A single-slot
+		// buffer can lose a short click when its release arrives before X reads
+		// the press. If a reader stalls for an entire queue, retain the newest
+		// input by dropping the oldest packet.
+		if mouse_res.used == mouse_queue_size {
+			mouse_res.read_ptr = (mouse_res.read_ptr + 1) % mouse_queue_size
+			mouse_res.used--
+		}
+		mouse_res.queue[mouse_res.write_ptr] = current_packet
+		mouse_res.write_ptr = (mouse_res.write_ptr + 1) % mouse_queue_size
+		mouse_res.used++
+		mouse_res.status |= file.pollin
 		mouse_res.l.release()
 
-		mouse_res.status |= file.pollin
-		event.trigger(mut mouse_res.event, false)
+		// Readiness is level-triggered by status/used. Do not accumulate stale
+		// wake credits while no poller is attached.
+		event.trigger(mut mouse_res.event, true)
 	}
 }
 

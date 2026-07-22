@@ -46,3 +46,112 @@ diff --color -urN --no-dereference '--exclude=.git' mlibc-clean/sysdeps/vinix/ge
  int sys_link(const char *old_path, const char *new_path) {
  	return sys_linkat(AT_FDCWD, old_path, AT_FDCWD, new_path, 0);
  }
+diff -urN --no-dereference mlibc-clean/sysdeps/vinix/include/vinix/seat.h mlibc-workdir/sysdeps/vinix/include/vinix/seat.h
+--- mlibc-clean/sysdeps/vinix/include/vinix/seat.h	1969-12-31 18:00:00.000000000 -0600
++++ mlibc-workdir/sysdeps/vinix/include/vinix/seat.h
+@@ -0,0 +1,90 @@
++#ifndef _VINIX_SEAT_H
++#define _VINIX_SEAT_H
++
++#include <stdint.h>
++
++#define VINIX_SEAT_ACQUIRE          0x5300
++#define VINIX_SEAT_RELEASE          0x5301
++#define VINIX_SEAT_GET_STATE        0x5302
++#define VINIX_SEAT_GET_DISPLAY_INFO 0x5303
++#define VINIX_SEAT_PRESENT          0x5304
++#define VINIX_SEAT_ATTACH_INPUT     0x5305
++
++#define VINIX_SEAT_CAP_DISPLAY  (1U << 0)
++#define VINIX_SEAT_CAP_KEYBOARD (1U << 1)
++#define VINIX_SEAT_CAP_POINTER  (1U << 2)
++#define VINIX_SEAT_CAP_ALL       (VINIX_SEAT_CAP_DISPLAY \
++                                | VINIX_SEAT_CAP_KEYBOARD \
++                                | VINIX_SEAT_CAP_POINTER)
++
++#define VINIX_SEAT_STATE_IDLE    0U
++#define VINIX_SEAT_STATE_ACTIVE  1U
++#define VINIX_SEAT_STATE_REVOKED 2U
++
++#define VINIX_SEAT_EVENT_ACQUIRED 1U
++#define VINIX_SEAT_EVENT_REVOKED  2U
++#define VINIX_SEAT_EVENT_RELEASED 3U
++#define VINIX_SEAT_EVENT_KEYBOARD 4U
++#define VINIX_SEAT_EVENT_POINTER  5U
++
++#define VINIX_SEAT_SOURCE_SYSTEM       0U
++#define VINIX_SEAT_SOURCE_PS2_KEYBOARD 1U
++#define VINIX_SEAT_SOURCE_PS2_POINTER  2U
++
++struct vinix_seat_acquire {
++	uint32_t terminal_id;
++	uint32_t capabilities;
++};
++
++struct vinix_seat_state {
++	uint32_t state;
++	uint32_t terminal_id;
++	uint32_t capabilities;
++	uint32_t reserved;
++	uint64_t generation;
++};
++
++struct vinix_seat_attach_input {
++	int32_t lease_fd;
++	uint32_t reserved;
++};
++
++struct vinix_seat_display_info {
++	uint32_t width;
++	uint32_t height;
++	uint32_t pitch;
++	uint32_t bits_per_pixel;
++	uint64_t buffer_size;
++	uint32_t red_size;
++	uint32_t red_shift;
++	uint32_t green_size;
++	uint32_t green_shift;
++	uint32_t blue_size;
++	uint32_t blue_shift;
++};
++
++/* A zero width or height presents the complete scanout buffer. */
++struct vinix_seat_present {
++	uint32_t x;
++	uint32_t y;
++	uint32_t width;
++	uint32_t height;
++};
++
++/*
++ * Input codes are interpreted in the namespace named by source. This keeps
++ * ownership independent from the input protocol while allowing a future input
++ * service to add normalized sources without changing the seat lease ABI.
++ */
++struct vinix_seat_event {
++	uint64_t sequence;
++	uint16_t kind;
++	uint16_t source;
++	uint32_t flags;
++	uint32_t code;
++	uint32_t reserved;
++	int64_t value0;
++	int64_t value1;
++};
++
++#endif
+diff -urN --no-dereference mlibc-clean/sysdeps/vinix/meson.build mlibc-workdir/sysdeps/vinix/meson.build
+--- mlibc-clean/sysdeps/vinix/meson.build
++++ mlibc-workdir/sysdeps/vinix/meson.build
+@@ -87,6 +87,11 @@
+ 	)
+ 
+ 	install_headers(
++		'include/vinix/seat.h',
++		subdir: 'vinix',
++	)
++
++	install_headers(
+ 		'include/mntent.h',
+ 		'include/utmpx.h',
+ 	)

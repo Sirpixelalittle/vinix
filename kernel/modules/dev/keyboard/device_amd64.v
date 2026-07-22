@@ -11,6 +11,7 @@ import katomic
 import klock
 import resource
 import stat
+import dev.seat
 
 const scancode_queue_size = 1024
 
@@ -28,6 +29,8 @@ mut:
 	write_ptr u64
 	used      u64
 	grab_owner voidptr
+	lease_owner voidptr
+	lease_token voidptr
 }
 
 __global (
@@ -47,6 +50,17 @@ pub fn initialise_device() {
 // during ownership transitions.
 pub fn submit_scancode(scancode u8) bool {
 	keyboard_device.l.acquire()
+	if keyboard_device.lease_token != unsafe { nil }
+		&& !seat.attachment_is_active(keyboard_device.lease_token,
+			ioctl.seat_cap_keyboard) {
+		// Keep the stale attachment as a deny-only binding until its handle
+		// closes or attaches a new active lease. Dropping it here would let the
+		// revoked client read the unrestricted legacy stream again.
+		keyboard_device.grab_owner = unsafe { nil }
+		keyboard_device.clear_queue_locked()
+		keyboard_device.l.release()
+		return false
+	}
 
 	// Keep the newest input if a reader stalls long enough to fill the queue.
 	// Normal operation drains this on every readable event.
@@ -61,7 +75,9 @@ pub fn submit_scancode(scancode u8) bool {
 	grabbed := keyboard_device.grab_owner != unsafe { nil }
 
 	keyboard_device.l.release()
-	event.trigger(mut keyboard_device.event, false)
+	// Readiness is level-triggered by status/used; a waiter needs a wake, but
+	// an unattached event must not accumulate stale poll wake credits.
+	event.trigger(mut keyboard_device.event, true)
 	return grabbed
 }
 
@@ -81,6 +97,15 @@ fn (mut this KeyboardDevice) read(_handle voidptr, buf voidptr, loc u64, count u
 
 	handle := unsafe { &file.Handle(_handle) }
 	this.l.acquire()
+	if seat.capability_is_leased(ioctl.seat_cap_keyboard)
+		|| this.lease_owner != unsafe { nil } {
+		if this.lease_owner != _handle || !seat.attachment_is_active(this.lease_token,
+			ioctl.seat_cap_keyboard) {
+			this.l.release()
+			errno.set(errno.eacces)
+			return none
+		}
+	}
 	for this.used == 0 {
 		this.l.release()
 		if handle.flags & resource.o_nonblock != 0 {
@@ -120,6 +145,40 @@ fn (mut this KeyboardDevice) write(handle voidptr, buf voidptr, loc u64, count u
 }
 
 fn (mut this KeyboardDevice) ioctl(handle voidptr, request u64, argp voidptr) ?int {
+	if request == ioctl.seat_attach_input {
+		if argp == unsafe { nil } {
+			errno.set(errno.efault)
+			return none
+		}
+		attachment := unsafe { *&ioctl.SeatAttachInput(argp) }
+		token := seat.attach_fd(attachment.lease_fd, ioctl.seat_cap_keyboard) or {
+			return none
+		}
+		this.l.acquire()
+		if this.lease_token != unsafe { nil }
+			&& !seat.attachment_is_active(this.lease_token,
+				ioctl.seat_cap_keyboard) {
+			seat.detach(this.lease_token)
+			this.lease_token = unsafe { nil }
+			this.lease_owner = unsafe { nil }
+			this.grab_owner = unsafe { nil }
+			this.clear_queue_locked()
+		}
+		if this.lease_owner != unsafe { nil } && this.lease_owner != handle {
+			this.l.release()
+			seat.detach(token)
+			errno.set(errno.ebusy)
+			return none
+		}
+		if this.lease_token != unsafe { nil } {
+			seat.detach(this.lease_token)
+		}
+		this.lease_owner = handle
+		this.lease_token = token
+		this.clear_queue_locked()
+		this.l.release()
+		return 0
+	}
 	if request != ioctl.eviocgrab {
 		return resource.default_ioctl(handle, request, argp)
 	}
@@ -171,6 +230,11 @@ fn (mut this KeyboardDevice) unref(handle voidptr) ? {
 	file_handle := unsafe { &file.Handle(handle) }
 	if katomic.load(&file_handle.descriptor_refcount) == 0 {
 		this.l.acquire()
+		if this.lease_owner == handle {
+			seat.detach(this.lease_token)
+			this.lease_owner = unsafe { nil }
+			this.lease_token = unsafe { nil }
+		}
 		if this.grab_owner == handle {
 			this.grab_owner = unsafe { nil }
 			this.clear_queue_locked()

@@ -6,6 +6,7 @@ import sched
 import event.eventstruct
 import aarch64.cpu
 import katomic
+import klock
 
 __global (
 	waiting_event_count = u64(0)
@@ -115,6 +116,58 @@ pub fn await(mut events []&eventstruct.Event, block bool) ?u64 {
 	sched.dequeue_thread(t)
 
 	unlock_events(mut events)
+
+	sched.yield(true)
+
+	katomic.dec(mut &waiting_event_count)
+
+	if t.enqueued_by_signal {
+		return none
+	}
+
+	return t.which_event
+}
+
+// See the amd64 implementation for the ordering contract. The caller enters
+// with interlock held; it is released only after this thread is registered as
+// an event listener and removed from the run queue.
+pub fn await_interlocked(mut events []&eventstruct.Event, block bool, mut interlock klock.Lock) ?u64 {
+	mut t := proc.current_thread()
+
+	cpu.interrupt_toggle(false)
+	defer {
+		cpu.interrupt_toggle(true)
+	}
+
+	lock_events(mut events)
+
+	if i := check_for_pending(mut events) {
+		unlock_events(mut events)
+		interlock.release()
+		return i
+	}
+
+	if block == false {
+		unlock_events(mut events)
+		interlock.release()
+		return none
+	}
+
+	katomic.inc(mut &waiting_event_count)
+
+	attach_listeners(mut events, mut t)
+	defer {
+		cpu.interrupt_toggle(false)
+		lock_events(mut events)
+		detach_listeners(mut t)
+		unlock_events(mut events)
+		cpu.interrupt_toggle(true)
+	}
+
+	sched.dequeue_thread(t)
+
+	unlock_events(mut events)
+	interlock.release()
 
 	sched.yield(true)
 

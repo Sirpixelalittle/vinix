@@ -28,6 +28,7 @@ import gpu.dcp
 import syscall as _
 import syscall.table
 import dev.console
+import dev.seat
 import dev.fbdev
 import dev.fbdev.simple
 import dev.streams
@@ -166,6 +167,7 @@ fn kmain_thread() {
 	print('kmain_thread: fbdev done\n')
 
 	console.initialise()
+	seat.initialise()
 	print('kmain_thread: console done\n')
 	term.early_stage_mark(12)
 

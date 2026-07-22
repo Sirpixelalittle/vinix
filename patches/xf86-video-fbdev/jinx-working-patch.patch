@@ -47,3 +47,25 @@ diff -urN --no-dereference xf86-video-fbdev-clean/src/fbdev.c xf86-video-fbdev-w
  #else
  	if (fPtr->pEnt->location.type == BUS_PCI)
  	    pci_dev = fPtr->pEnt->location.id.pci;
+@@ -658,18 +660,21 @@
+ #ifdef HAVE_SHADOW_3224
+     shadowUpdate32to24(pScreen, pBuf);
+ #endif
++    fbdevHWPresent(xf86ScreenToScrn(pScreen));
+ }
+ 
+ static void
+ fbdevUpdateRotatePacked(ScreenPtr pScreen, shadowBufPtr pBuf)
+ {
+     shadowUpdateRotatePacked(pScreen, pBuf);
++    fbdevHWPresent(xf86ScreenToScrn(pScreen));
+ }
+ 
+ static void
+ fbdevUpdatePacked(ScreenPtr pScreen, shadowBufPtr pBuf)
+ {
+     shadowUpdatePacked(pScreen, pBuf);
++    fbdevHWPresent(xf86ScreenToScrn(pScreen));
+ }
+ 
+ static Bool

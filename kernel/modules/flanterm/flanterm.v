@@ -17,6 +17,12 @@ fn C.flanterm_fb_init(_malloc voidptr, _free voidptr,
 @[c_extern]
 fn C.flanterm_write(context voidptr, buf charptr, count u64)
 @[c_extern]
+fn C.flanterm_flush(context voidptr)
+@[c_extern]
+fn C.flanterm_full_refresh(context voidptr)
+@[c_extern]
+fn C.flanterm_set_autoflush(context voidptr, state bool)
+@[c_extern]
 fn C.flanterm_get_dimensions(context voidptr, cols &u64, rows &u64)
 @[c_extern]
 fn C.flanterm_set_callback(context voidptr, callback voidptr)

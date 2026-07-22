@@ -134,7 +134,82 @@ diff -urN --no-dereference xorg-server-clean/hw/xfree86/fbdevhw/fbdevhw.c xorg-s
  #include "globals.h"
  #include <X11/extensions/dpmsconst.h>
  
-@@ -259,6 +259,7 @@
+@@ -48,6 +48,74 @@
+ #include <stdlib.h>
+ #include <unistd.h>
+ 
++#ifdef __vinix__
++#include <vinix/seat.h>
++
++extern int xf86VinixSeatFd(void);
++
++static int
++vinix_fb_ioctl(int fd, unsigned long request, void *arg)
++{
++    struct vinix_seat_display_info info;
++
++    switch (request) {
++    case FBIOGET_FSCREENINFO: {
++        struct fb_fix_screeninfo *fix = arg;
++        if (ioctl(fd, VINIX_SEAT_GET_DISPLAY_INFO, &info) < 0)
++            return -1;
++        memset(fix, 0, sizeof(*fix));
++        strncpy(fix->id, "Vinix seat", sizeof(fix->id));
++        fix->smem_len = info.buffer_size;
++        fix->type = FB_TYPE_PACKED_PIXELS;
++        fix->visual = FB_VISUAL_TRUECOLOR;
++        fix->line_length = info.pitch;
++        return 0;
++    }
++    case FBIOGET_VSCREENINFO: {
++        struct fb_var_screeninfo *var = arg;
++        if (ioctl(fd, VINIX_SEAT_GET_DISPLAY_INFO, &info) < 0)
++            return -1;
++        memset(var, 0, sizeof(*var));
++        var->xres = var->xres_virtual = info.width;
++        var->yres = var->yres_virtual = info.height;
++        var->bits_per_pixel = info.bits_per_pixel;
++        var->red.length = info.red_size;
++        var->red.offset = info.red_shift;
++        var->green.length = info.green_size;
++        var->green.offset = info.green_shift;
++        var->blue.length = info.blue_size;
++        var->blue.offset = info.blue_shift;
++        var->activate = FB_ACTIVATE_NOW;
++        return 0;
++    }
++    case FBIOPUT_VSCREENINFO: {
++        struct fb_var_screeninfo current;
++        struct fb_var_screeninfo *requested = arg;
++        if (vinix_fb_ioctl(fd, FBIOGET_VSCREENINFO, &current) < 0)
++            return -1;
++        if (requested->xres != current.xres || requested->yres != current.yres
++                || requested->bits_per_pixel != current.bits_per_pixel) {
++            errno = EINVAL;
++            return -1;
++        }
++        *requested = current;
++        return 0;
++    }
++    case FBIOBLANK:
++    case FBIOPUTCMAP:
++    case FBIOGETCMAP:
++        return 0;
++    case FBIOPAN_DISPLAY:
++        errno = EINVAL;
++        return -1;
++    default:
++        return ioctl(fd, request, arg);
++    }
++}
++
++#define ioctl(fd, request, arg) vinix_fb_ioctl((fd), (request), (void *)(arg))
++#endif
++
+ /* -------------------------------------------------------------------- */
+ /* our private data, and two functions to allocate/free this            */
+ 
+@@ -259,6 +327,7 @@
  /**
   * Try to find the framebuffer device for a given PCI device
   */
@@ -142,7 +217,7 @@ diff -urN --no-dereference xorg-server-clean/hw/xfree86/fbdevhw/fbdevhw.c xorg-s
  static int
  fbdev_open_pci(struct pci_device *pPci, char **namep)
  {
-@@ -303,6 +304,7 @@
+@@ -303,6 +372,7 @@
      xf86DrvMsg(-1, X_ERROR, "Unable to find a valid framebuffer device\n");
      return -1;
  }
@@ -150,7 +225,27 @@ diff -urN --no-dereference xorg-server-clean/hw/xfree86/fbdevhw/fbdevhw.c xorg-s
  
  static int
  fbdev_open(int scrnIndex, const char *dev, char **namep)
-@@ -330,6 +332,7 @@
+@@ -310,6 +380,11 @@
+     struct fb_fix_screeninfo fix;
+     int fd;
+ 
++#ifdef __vinix__
++    (void)dev;
++    dev = "/dev/seat0";
++    fd = dup(xf86VinixSeatFd());
++#else
+     /* try argument (from XF86Config) first */
+     if (dev) {
+         fd = open(dev, O_RDWR, 0);
+@@ -323,6 +398,7 @@
+             fd = open(dev, O_RDWR, 0);
+         }
+     }
++#endif
+ 
+     if (fd == -1) {
+         xf86DrvMsg(scrnIndex, X_ERROR, "open %s: %s\n", dev, strerror(errno));
+@@ -330,6 +406,7 @@
      }
  
      /* only touch non-PCI devices on this path */
@@ -158,7 +253,7 @@ diff -urN --no-dereference xorg-server-clean/hw/xfree86/fbdevhw/fbdevhw.c xorg-s
      {
          char buf[PATH_MAX] = {0};
          char *sysfs_path = NULL;
-@@ -344,6 +347,7 @@
+@@ -344,6 +421,7 @@
          }
          free(sysfs_path);
      }
@@ -166,7 +261,7 @@ diff -urN --no-dereference xorg-server-clean/hw/xfree86/fbdevhw/fbdevhw.c xorg-s
  
      if (namep) {
          if (-1 == ioctl(fd, FBIOGET_FSCREENINFO, (void *) (&fix))) {
-@@ -363,14 +367,11 @@
+@@ -363,14 +441,11 @@
  /* -------------------------------------------------------------------- */
  
  Bool
@@ -183,7 +278,7 @@ diff -urN --no-dereference xorg-server-clean/hw/xfree86/fbdevhw/fbdevhw.c xorg-s
  
      if (-1 == fd)
          return FALSE;
-@@ -379,7 +380,7 @@
+@@ -379,7 +454,7 @@
  }
  
  Bool
@@ -192,7 +287,7 @@ diff -urN --no-dereference xorg-server-clean/hw/xfree86/fbdevhw/fbdevhw.c xorg-s
  {
      fbdevHWPtr fPtr;
  
-@@ -387,10 +388,7 @@
+@@ -387,10 +462,7 @@
      fPtr = FBDEVHWPTR(pScrn);
  
      /* open device */
@@ -204,7 +299,27 @@ diff -urN --no-dereference xorg-server-clean/hw/xfree86/fbdevhw/fbdevhw.c xorg-s
      if (-1 == fPtr->fd) {
          xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
                     "Failed to open framebuffer device, consult warnings"
-@@ -881,7 +879,7 @@
+@@ -473,6 +545,19 @@
+     return fPtr->fix.smem_len;
+ }
+ 
++Bool
++fbdevHWPresent(ScrnInfoPtr pScrn)
++{
++#ifdef __vinix__
++    fbdevHWPtr fPtr = FBDEVHWPTR(pScrn);
++    struct vinix_seat_present present = {0};
++    return ioctl(fPtr->fd, VINIX_SEAT_PRESENT, &present) == 0;
++#else
++    (void)pScrn;
++    return TRUE;
++#endif
++}
++
+ static Bool
+ fbdevHWSetMode(ScrnInfoPtr pScrn, DisplayModePtr mode, Bool check)
+ {
+@@ -881,7 +966,7 @@
                         "FBIOBLANK: %s\n", strerror(errno));
  	    break;
          case EINTR:
@@ -213,7 +328,7 @@ diff -urN --no-dereference xorg-server-clean/hw/xfree86/fbdevhw/fbdevhw.c xorg-s
              goto RETRY;
          default:
              fPtr->unsupported_ioctls |= (1 << FBIOBLANK_UNSUPPORTED);
-@@ -915,7 +913,7 @@
+@@ -915,7 +1000,7 @@
                         "FBIOBLANK: %s\n", strerror(errno));
              break;
          case EINTR:
@@ -237,6 +352,14 @@ diff -urN --no-dereference xorg-server-clean/hw/xfree86/fbdevhw/fbdevhw.h xorg-s
                                    char *device);
  
  extern _X_EXPORT char *fbdevHWGetName(ScrnInfoPtr pScrn);
+@@ -26,6 +26,7 @@
+ extern _X_EXPORT int fbdevHWGetLineLength(ScrnInfoPtr pScrn);
+ extern _X_EXPORT int fbdevHWGetType(ScrnInfoPtr pScrn);
+ extern _X_EXPORT int fbdevHWGetVidmem(ScrnInfoPtr pScrn);
++extern _X_EXPORT Bool fbdevHWPresent(ScrnInfoPtr pScrn);
+ 
+ extern _X_EXPORT void *fbdevHWMapVidmem(ScrnInfoPtr pScrn);
+ extern _X_EXPORT int fbdevHWLinearOffset(ScrnInfoPtr pScrn);
 diff -urN --no-dereference xorg-server-clean/hw/xfree86/os-support/shared/posix_tty.c xorg-server-workdir/hw/xfree86/os-support/shared/posix_tty.c
 --- xorg-server-clean/hw/xfree86/os-support/shared/posix_tty.c
 +++ xorg-server-workdir/hw/xfree86/os-support/shared/posix_tty.c
@@ -263,6 +386,65 @@ diff -urN --no-dereference xorg-server-clean/hw/xfree86/os-support/shared/sigio.
  #include <X11/X.h>
  #include <xserver_poll.h>
  #include "xf86.h"
+diff -urN --no-dereference xorg-server-clean/hw/xfree86/os-support/stub/stub_init.c xorg-server-workdir/hw/xfree86/os-support/stub/stub_init.c
+--- xorg-server-clean/hw/xfree86/os-support/stub/stub_init.c
++++ xorg-server-workdir/hw/xfree86/os-support/stub/stub_init.c
+@@ -3,15 +3,55 @@
+ #endif
+ 
+ #include "xf86_OSlib.h"
++#include "xf86.h"
++
++#include <errno.h>
++#include <fcntl.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++#include <vinix/seat.h>
++
++static int vinixSeatFd = -1;
++
++_X_EXPORT int
++xf86VinixSeatFd(void)
++{
++    return vinixSeatFd;
++}
+ 
+ void
+ xf86OpenConsole(void)
+ {
++    struct vinix_seat_state state = {0};
++    struct vinix_seat_acquire acquire = {0};
++
++    if (vinixSeatFd >= 0)
++        return;
++
++    vinixSeatFd = open("/dev/seat0", O_RDWR | O_CLOEXEC);
++    if (vinixSeatFd < 0)
++        FatalError("Cannot open /dev/seat0: %s\n", strerror(errno));
++
++    if (ioctl(vinixSeatFd, VINIX_SEAT_GET_STATE, &state) < 0)
++        FatalError("Cannot query /dev/seat0: %s\n", strerror(errno));
++
++    acquire.terminal_id = state.terminal_id;
++    acquire.capabilities = VINIX_SEAT_CAP_ALL;
++    if (ioctl(vinixSeatFd, VINIX_SEAT_ACQUIRE, &acquire) < 0)
++        FatalError("Cannot acquire seat0 for tty%u: %s\n",
++                   acquire.terminal_id, strerror(errno));
+ }
+ 
+ void
+ xf86CloseConsole(void)
+ {
++    if (vinixSeatFd < 0)
++        return;
++    if (ioctl(vinixSeatFd, VINIX_SEAT_RELEASE, NULL) < 0 && errno != EINVAL)
++        xf86Msg(X_WARNING, "Cannot release seat0: %s\n", strerror(errno));
++    close(vinixSeatFd);
++    vinixSeatFd = -1;
+ }
+ 
+ int
 diff -urN --no-dereference xorg-server-clean/include/os.h xorg-server-workdir/include/os.h
 --- xorg-server-clean/include/os.h
 +++ xorg-server-workdir/include/os.h

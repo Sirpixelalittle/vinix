@@ -141,10 +141,6 @@ pub fn fork_pagemap(_old_pagemap &memory.Pagemap) ?&memory.Pagemap {
 		}
 		new_local_range.pagemap = new_pagemap
 
-		if voidptr(global_range.resource) != unsafe { nil } {
-			global_range.resource.refcount++
-		}
-
 		if local_range.flags & map_shared != 0 {
 			global_range.locals << new_local_range
 			for i := local_range.base; i < local_range.base + local_range.length; i += page_size {
@@ -155,6 +151,12 @@ pub fn fork_pagemap(_old_pagemap &memory.Pagemap) ?&memory.Pagemap {
 				}
 			}
 		} else {
+			// A private fork gets a distinct global mapping object, so it owns a
+			// distinct resource reference. Shared mappings keep using the original
+			// global object and therefore need no additional resource reference.
+			if voidptr(global_range.resource) != unsafe { nil } {
+				global_range.resource.refcount++
+			}
 			mut new_global_range := &MmapRangeGlobal{
 				resource:       unsafe { nil }
 				shadow_pagemap: memory.Pagemap{
@@ -539,8 +541,11 @@ pub fn munmap_unlocked(mut pagemap memory.Pagemap, addr voidptr, _length u64) ? 
 						}
 						memory.pmm_free(voidptr(phys), 1)
 					}
-				} else {
-					// global_range.resource.munmap(i)
+				} else if voidptr(global_range.resource) != unsafe { nil } {
+					// The global mapping owns exactly one resource reference. Range
+					// splits and MAP_SHARED fork children all share this object, so the
+					// reference is released only with its final local range.
+					global_range.resource.unref(unsafe { nil }) or {}
 				}
 				memory.pmm_free(global_range.shadow_pagemap.top_level, 1)
 				unsafe {
