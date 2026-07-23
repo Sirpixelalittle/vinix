@@ -96,17 +96,27 @@ Completion criteria:
 
 ### Thread descriptor reference management
 
-- [ ] Replace long-lived borrowed `Thread` pointers in console and timer state
+- [x] Replace long-lived borrowed `Thread` pointers in console and timer state
   with reference-counted handles or process-level identifiers.
-- [ ] Reclaim retired `Thread` descriptors after the last external reference
+- [x] Reclaim retired `Thread` descriptors after the last external reference
   is released.
 
 Evidence:
 
-- The scheduler reaper releases each retired thread's physical kernel stacks
-  and FPU storage, which account for nearly all of its memory, but retains the
-  small non-runnable descriptor as a tombstone. Freeing that descriptor today
-  would leave dangling pointers in legacy console, timer, and signal paths.
+- `Thread` descriptors now carry explicit references for scheduler lifetime,
+  process registries, kernel pthread handles, console caches, and transient
+  signal delivery. Process lookup returns an acquired handle rather than a
+  borrowed pointer.
+- Console caches use irq-safe locks and own the descriptor they publish.
+  ARM64 interval timers retain a process identity and resolve its current
+  thread at delivery time, so `execve()` cannot leave a stale timer target.
+- The scheduler reaper removes descriptors from its locked retirement queue,
+  releases stacks and FPU storage after the context-switch grace period, and
+  then drops the scheduler's final runtime reference. The descriptor is freed
+  as soon as all remaining owners release it.
+- The 4-vCPU, 2 GiB QEMU image passed 256 rounds of
+  `execve-sibling-stress`; a console Ctrl-C probe then exercised the retained
+  console target and returned cleanly to the shell.
 
 ### ARM64 false-success syscall compatibility
 

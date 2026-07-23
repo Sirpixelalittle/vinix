@@ -24,19 +24,52 @@ const console_buffer_size = 1024
 const console_bigbuf_size = 4096
 
 __global (
-	console_res       = &Console(unsafe { nil })
-	console_read_lock klock.Lock
-	console_event     eventstruct.Event
-	console_buffer    [console_buffer_size]u8
-	console_buffer_i  = u64(0)
-	console_bigbuf    [console_bigbuf_size]u8
-	console_bigbuf_i  = u64(0)
-	console_termios   = &termios.Termios(unsafe { nil })
-	console_decckm    = false
+	console_res        = &Console(unsafe { nil })
+	console_read_lock  klock.Lock
+	console_event      eventstruct.Event
+	console_buffer     [console_buffer_size]u8
+	console_buffer_i   = u64(0)
+	console_bigbuf     [console_bigbuf_size]u8
+	console_bigbuf_i   = u64(0)
+	console_termios    = &termios.Termios(unsafe { nil })
+	console_decckm     = false
 	// XXX this is a massive hack to allow ctrl-c and friends without process
 	// groups
-	latest_thread     = &proc.Thread(unsafe { nil })
+	latest_thread_lock klock.Lock
+	latest_thread      = &proc.Thread(unsafe { nil })
 )
+
+fn remember_thread(thrd &proc.Thread) {
+	if thrd == unsafe { nil } {
+		return
+	}
+
+	proc.thread_ref(thrd)
+	interrupts_were_enabled := latest_thread_lock.acquire_irqsave()
+	old_thread := latest_thread
+	unsafe {
+		latest_thread = thrd
+	}
+	latest_thread_lock.release_irqrestore(interrupts_were_enabled)
+
+	if old_thread != unsafe { nil } {
+		proc.thread_unref(old_thread)
+	}
+}
+
+fn signal_latest_thread(signal int) {
+	interrupts_were_enabled := latest_thread_lock.acquire_irqsave()
+	thrd := latest_thread
+	if thrd != unsafe { nil } {
+		proc.thread_ref(thrd)
+	}
+	latest_thread_lock.release_irqrestore(interrupts_were_enabled)
+
+	if thrd != unsafe { nil } {
+		userland.sendsig(thrd, u8(signal))
+		proc.thread_unref(thrd)
+	}
+}
 
 fn is_printable(c u8) bool {
 	return c >= 0x20 && c <= 0x7e
@@ -142,7 +175,7 @@ fn add_to_buf(ptr &u8, count u64, echo bool) {
 		c := unsafe { ptr[i] }
 		if console_termios.c_lflag & termios.isig != 0 {
 			if c == console_termios.c_cc[termios.vintr] {
-				userland.sendsig(latest_thread, userland.sigint)
+				signal_latest_thread(userland.sigint)
 			}
 		}
 		add_to_buf_char(c, echo)
@@ -261,7 +294,7 @@ fn (mut this Console) mmap(page u64, flags int) voidptr {
 }
 
 fn (mut this Console) read(handle voidptr, void_buf voidptr, loc u64, count u64) ?i64 {
-	latest_thread = proc.current_thread()
+	remember_thread(proc.current_thread())
 
 	mut buf := &u8(void_buf)
 
@@ -319,7 +352,7 @@ fn (mut this Console) read(handle voidptr, void_buf voidptr, loc u64, count u64)
 }
 
 fn (mut this Console) write(handle voidptr, buf voidptr, loc u64, count u64) ?i64 {
-	latest_thread = proc.current_thread()
+	remember_thread(proc.current_thread())
 
 	copy := unsafe { malloc(count) }
 	defer {
@@ -332,7 +365,7 @@ fn (mut this Console) write(handle voidptr, buf voidptr, loc u64, count u64) ?i6
 }
 
 fn (mut this Console) ioctl(handle voidptr, request u64, argp voidptr) ?int {
-	latest_thread = proc.current_thread()
+	remember_thread(proc.current_thread())
 
 	match request {
 		ioctl.tiocgwinsz {

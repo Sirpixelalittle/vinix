@@ -30,14 +30,50 @@ pub fn (mut l Lock) acquire() {
 	}
 }
 
+// Acquire a lock while keeping the saved interrupt state in the caller.
+// Unlike acquire(), this is safe when different CPUs can contend for the same
+// lock because a later owner cannot overwrite the previous owner's restore
+// token.
+pub fn (mut l Lock) acquire_irqsave() bool {
+	interrupts_were_enabled := cpu.interrupt_toggle(false)
+	for !katomic.cas(mut &l.l, u64(0), u64(1)) {
+		asm volatile aarch64 {
+			wfe
+			; ; ; memory
+		}
+	}
+	return interrupts_were_enabled
+}
+
+pub fn (mut l Lock) try_acquire_irqsave() (bool, bool) {
+	interrupts_were_enabled := cpu.interrupt_toggle(false)
+	if katomic.cas(mut &l.l, u64(0), u64(1)) {
+		return true, interrupts_were_enabled
+	}
+	cpu.interrupt_toggle(interrupts_were_enabled)
+	return false, false
+}
+
 pub fn (mut l Lock) release() {
+	// Capture the previous interrupt state while this CPU still owns the lock.
+	// Once l.l becomes zero, a new owner may immediately overwrite l.ints.
+	interrupts_were_enabled := l.ints
 	katomic.store(mut &l.l, u64(0))
 	// Send event to wake up any WFE-spinning CPUs
 	asm volatile aarch64 {
 		sev
 		; ; ; memory
 	}
-	cpu.interrupt_toggle(l.ints)
+	cpu.interrupt_toggle(interrupts_were_enabled)
+}
+
+pub fn (mut l Lock) release_irqrestore(interrupts_were_enabled bool) {
+	katomic.store(mut &l.l, u64(0))
+	asm volatile aarch64 {
+		sev
+		; ; ; memory
+	}
+	cpu.interrupt_toggle(interrupts_were_enabled)
 }
 
 pub fn (mut l Lock) test_and_acquire() bool {

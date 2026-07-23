@@ -350,6 +350,7 @@ pub fn new_kernel_thread(pc voidptr, arg voidptr, autoenqueue bool) &proc.Thread
 
 	mut t := &proc.Thread{
 		process:     kernel_process
+		descriptor_refs: 1
 		ttbr0:       u64(kernel_process.pagemap.top_level)
 		gpr_state:   gpr_state
 		timeslice:   5000
@@ -454,6 +455,7 @@ pub fn new_user_thread(_process &proc.Process, want_elf bool, pc voidptr, arg vo
 
 	mut t := &proc.Thread{
 		process:      process
+		descriptor_refs: 1
 		ttbr0:        u64(process.pagemap.top_level)
 		gpr_state:    gpr_state
 		timeslice:    5000
@@ -578,12 +580,14 @@ pub fn new_user_thread(_process &proc.Process, want_elf bool, pc voidptr, arg vo
 
 	if register_with_process {
 		t.tid = process.threads.len
+		proc.thread_ref(t)
 		process.threads << t
 	}
 
 	if autoenqueue == true && !enqueue_thread(t, false) {
 		if register_with_process {
 			process.threads.delete(process.threads.len - 1)
+			proc.thread_unref(t)
 		}
 		discard_unstarted_thread(t)
 		errno.set(errno.eagain)
@@ -597,6 +601,9 @@ pub fn discard_unstarted_thread(_thread &proc.Thread) {
 	mut t := unsafe { _thread }
 	if t.is_in_queue || t.running_on != u64(-1) {
 		panic('Attempted to discard a runnable thread')
+	}
+	if katomic.load(&t.descriptor_refs) != 1 {
+		panic('Attempted to discard a published Thread descriptor')
 	}
 
 	for stack_phys in t.stacks {
@@ -684,7 +691,7 @@ const max_itimer_real = 32
 
 struct ItimerRealEntry {
 mut:
-	thrd        &proc.Thread = unsafe { nil }
+	process     &proc.Process = unsafe { nil }
 	value_us    i64 // microseconds remaining (0 = inactive)
 	interval_us i64 // microseconds to reload after firing
 	active      bool
@@ -723,8 +730,12 @@ fn tick_itimers() {
 		return
 	}
 
-	if !itimer_real_lock.test_and_acquire() {
+	acquired, interrupts_were_enabled := itimer_real_lock.try_acquire_irqsave()
+	if !acquired {
 		return
+	}
+	defer {
+		itimer_real_lock.release_irqrestore(interrupts_were_enabled)
 	}
 
 	for i := 0; i < max_itimer_real; i++ {
@@ -734,36 +745,45 @@ fn tick_itimers() {
 		}
 		e.value_us -= elapsed_us
 		if e.value_us <= 0 {
-			// Fire SIGALRM (signal 14)
-			katomic.bts(mut &e.thrd.pending_signals, u8(14))
-			enqueue_thread(e.thrd, true)
+			// Resolve the process's current main thread at delivery time so a
+			// timer remains valid across execve() and never retains a retired
+			// Thread descriptor.
+			mut thrd := proc.first_thread_ref(e.process)
+			if thrd != unsafe { nil } {
+				katomic.bts(mut &thrd.pending_signals, u8(14))
+				enqueue_thread(thrd, true)
+				proc.thread_unref(thrd)
+			}
 			if e.interval_us > 0 {
 				e.value_us = e.interval_us
 			} else {
 				e.active = false
+				e.process = unsafe { nil }
 			}
 		}
 	}
 
-	itimer_real_lock.release()
 }
 
-// set_itimer_real arms or disarms a per-thread ITIMER_REAL timer.
+// set_itimer_real arms or disarms a per-process ITIMER_REAL timer.
 // Returns the previous (value_us, interval_us).
-pub fn set_itimer_real(thrd &proc.Thread, value_us i64, interval_us i64) (i64, i64) {
-	itimer_real_lock.acquire()
+pub fn set_itimer_real(process &proc.Process, value_us i64, interval_us i64) (i64, i64) {
+	interrupts_were_enabled := itimer_real_lock.acquire_irqsave()
 	defer {
-		itimer_real_lock.release()
+		itimer_real_lock.release_irqrestore(interrupts_were_enabled)
 	}
 
-	// Find existing entry for this thread
+	// Find the existing entry for this process.
 	for i := 0; i < max_itimer_real; i++ {
 		mut e := unsafe { &itimer_real_entries[i] }
-		if e.active && e.thrd == thrd {
+		if e.active && voidptr(e.process) == voidptr(process) {
 			old_value := e.value_us
 			old_interval := e.interval_us
 			if value_us <= 0 && interval_us <= 0 {
 				e.active = false
+				e.process = unsafe { nil }
+				e.value_us = 0
+				e.interval_us = 0
 			} else {
 				e.value_us = value_us
 				e.interval_us = interval_us
@@ -777,7 +797,7 @@ pub fn set_itimer_real(thrd &proc.Thread, value_us i64, interval_us i64) (i64, i
 		for i := 0; i < max_itimer_real; i++ {
 			mut e := unsafe { &itimer_real_entries[i] }
 			if !e.active {
-				e.thrd = unsafe { thrd }
+				e.process = unsafe { process }
 				e.value_us = value_us
 				e.interval_us = interval_us
 				e.active = true
@@ -789,16 +809,20 @@ pub fn set_itimer_real(thrd &proc.Thread, value_us i64, interval_us i64) (i64, i
 	return 0, 0
 }
 
-// get_itimer_real returns the current (value_us, interval_us) for a thread.
-pub fn get_itimer_real(thrd &proc.Thread) (i64, i64) {
-	itimer_real_lock.acquire()
+pub fn disarm_itimer_real(process &proc.Process) {
+	set_itimer_real(process, 0, 0)
+}
+
+// get_itimer_real returns the current (value_us, interval_us) for a process.
+pub fn get_itimer_real(process &proc.Process) (i64, i64) {
+	interrupts_were_enabled := itimer_real_lock.acquire_irqsave()
 	defer {
-		itimer_real_lock.release()
+		itimer_real_lock.release_irqrestore(interrupts_were_enabled)
 	}
 
 	for i := 0; i < max_itimer_real; i++ {
 		e := itimer_real_entries[i]
-		if e.active && e.thrd == thrd {
+		if e.active && voidptr(e.process) == voidptr(process) {
 			return e.value_us, e.interval_us
 		}
 	}

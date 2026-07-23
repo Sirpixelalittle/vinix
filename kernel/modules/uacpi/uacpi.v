@@ -540,6 +540,7 @@ fn start_runtime() UACPIStatus {
 	mut worker := sched.new_kernel_thread(voidptr(uacpi_work_thread), unsafe { nil }, false)
 	worker.affinity = 0
 	if !sched.enqueue_thread(worker, false) {
+		sched.discard_unstarted_thread(worker)
 		return UACPIStatus.out_of_memory
 	}
 

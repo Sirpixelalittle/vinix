@@ -35,9 +35,10 @@ pub mut:
 	exiting                  bool
 }
 
-// Return a stable thread pointer without exposing the Process.threads array
-// while another CPU may replace its backing storage during exec.
-pub fn first_thread(_process &Process) &Thread {
+// Acquire the first thread registered to a process without exposing the
+// Process.threads array while another CPU may replace its backing storage.
+// The caller must release the returned reference with thread_unref().
+pub fn first_thread_ref(_process &Process) &Thread {
 	mut process := unsafe { _process }
 	process.threads_lock.acquire()
 	defer {
@@ -46,7 +47,48 @@ pub fn first_thread(_process &Process) &Thread {
 	if process.threads.len == 0 {
 		return unsafe { nil }
 	}
-	return process.threads[0]
+	mut thrd := process.threads[0]
+	thread_ref(thrd)
+	return thrd
+}
+
+// Every allocated descriptor starts with one scheduler-lifecycle reference.
+// Process registries, pthread handles, and long-lived kernel caches acquire
+// additional references before publishing a Thread pointer.
+pub fn thread_ref(_thread &Thread) {
+	mut thrd := unsafe { _thread }
+	if thrd == unsafe { nil } {
+		panic('Attempted to reference a nil Thread descriptor')
+	}
+	if katomic.inc(mut &thrd.descriptor_refs) == 0 {
+		panic('Attempted to resurrect a released Thread descriptor')
+	}
+}
+
+// The scheduler releases the lifecycle reference only after runtime resources
+// are quiescent and reclaimed. Consequently a zero count means no CPU, process
+// registry, timer, console, or pthread handle can still reach the descriptor.
+pub fn thread_unref(_thread &Thread) {
+	mut thrd := unsafe { _thread }
+	if thrd == unsafe { nil } {
+		panic('Attempted to release a nil Thread descriptor')
+	}
+	if katomic.load(&thrd.descriptor_refs) == 0 {
+		panic('Thread descriptor reference underflow')
+	}
+	if katomic.dec(mut &thrd.descriptor_refs) {
+		return
+	}
+	if !katomic.load(&thrd.runtime_reclaimed) {
+		panic('Thread descriptor released before runtime reclamation')
+	}
+	if thrd.is_in_queue || katomic.load(&thrd.running_on) != u64(-1) {
+		panic('Runnable Thread descriptor reached its final reference')
+	}
+	unsafe {
+		thrd.signalfds.free()
+		free(thrd)
+	}
 }
 
 pub struct SigAction {

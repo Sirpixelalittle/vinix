@@ -350,11 +350,12 @@ pub fn syscall_kill(_ voidptr, pid int, signal int) (u64, u64) {
 		if pid <= 0 || pid >= 65536 || processes[pid] == unsafe { nil } {
 			return errno.err, errno.esrch
 		}
-		thrd := proc.first_thread(processes[pid])
+		thrd := proc.first_thread_ref(processes[pid])
 		if thrd == unsafe { nil } {
 			return errno.err, errno.esrch
 		}
 		sendsig(thrd, u8(signal))
+		proc.thread_unref(thrd)
 	} else {
 		panic('sendsig: Values of signal <= 0 not supported')
 	}
@@ -451,7 +452,9 @@ pub fn syscall_exit(_ voidptr, status int) {
 		terminate_current_thread()
 	}
 
+	sched.disarm_itimer_real(current_process)
 	stop_process_siblings(current_process, current_thread)
+	detach_process_threads(current_process)
 
 	mut old_pagemap := current_process.pagemap
 
@@ -515,6 +518,7 @@ pub fn syscall_fork(gpr_state &cpulocal.GPRState) (u64, u64) {
 	mut new_thread := &proc.Thread{
 		gpr_state:      gpr_state
 		process:        new_process
+		descriptor_refs: 1
 		timeslice:      old_thread.timeslice
 		tpidr_el0:      cpu.read_tpidr_el0()
 		kernel_stack:   kernel_stack
@@ -539,6 +543,7 @@ pub fn syscall_fork(gpr_state &cpulocal.GPRState) (u64, u64) {
 	old_process.children << new_process
 	new_process.threads_lock.acquire()
 	new_thread.tid = new_process.threads.len
+	proc.thread_ref(new_thread)
 	new_process.threads << new_thread
 	new_process.threads_lock.release()
 

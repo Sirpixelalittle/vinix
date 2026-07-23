@@ -127,10 +127,32 @@ pub fn finish_exec(_process &proc.Process, replacement &proc.Thread) {
 	process.threads = []&proc.Thread{}
 	mut new_thread := unsafe { replacement }
 	new_thread.tid = 0
+	proc.thread_ref(new_thread)
 	process.threads << new_thread
 	process.execing = false
 	process.threads_lock.release()
 
+	for old_thread in old_threads {
+		proc.thread_unref(old_thread)
+	}
+	unsafe {
+		old_threads.free()
+	}
+}
+
+// Remove the process registry's ownership after every sibling has stopped.
+// Each retiring thread retains its scheduler-lifecycle reference until the
+// reaper has released its stacks and FPU state.
+pub fn detach_process_threads(_process &proc.Process) {
+	mut process := unsafe { _process }
+	process.threads_lock.acquire()
+	mut old_threads := unsafe { process.threads }
+	process.threads = []&proc.Thread{}
+	process.threads_lock.release()
+
+	for old_thread in old_threads {
+		proc.thread_unref(old_thread)
+	}
 	unsafe {
 		old_threads.free()
 	}

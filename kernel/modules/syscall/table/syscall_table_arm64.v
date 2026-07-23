@@ -393,7 +393,7 @@ fn syscall_linux_setitimer(_ voidptr, which int, new_value u64, old_value u64) (
 		value_us = value_sec * 1000000 + value_usec
 	}
 
-	old_val, old_int := sched.set_itimer_real(current_thread, value_us, interval_us)
+	old_val, old_int := sched.set_itimer_real(current_thread.process, value_us, interval_us)
 
 	if old_value != 0 {
 		unsafe {
@@ -416,7 +416,7 @@ fn syscall_linux_getitimer(_ voidptr, which int, curr_value u64) (u64, u64) {
 	}
 
 	current_thread := proc.current_thread()
-	val, intv := sched.get_itimer_real(current_thread)
+	val, intv := sched.get_itimer_real(current_thread.process)
 
 	unsafe {
 		*&i64(curr_value) = intv / 1000000      // it_interval.tv_sec

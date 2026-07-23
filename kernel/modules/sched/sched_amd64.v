@@ -361,6 +361,7 @@ pub fn new_kernel_thread(pc voidptr, arg voidptr, autoenqueue bool) &proc.Thread
 
 	mut t := &proc.Thread{
 		process:     kernel_process
+		descriptor_refs: 1
 		cr3:         u64(kernel_process.pagemap.top_level)
 		gpr_state:   gpr_state
 		timeslice:   5000
@@ -474,6 +475,7 @@ pub fn new_user_thread(_process &proc.Process, want_elf bool, pc voidptr, arg vo
 
 	mut t := &proc.Thread{
 		process:      process
+		descriptor_refs: 1
 		cr3:          u64(process.pagemap.top_level)
 		gpr_state:    gpr_state
 		timeslice:    5000
@@ -584,12 +586,14 @@ pub fn new_user_thread(_process &proc.Process, want_elf bool, pc voidptr, arg vo
 
 	if register_with_process {
 		t.tid = process.threads.len
+		proc.thread_ref(t)
 		process.threads << t
 	}
 
 	if autoenqueue == true && !enqueue_thread(t, false) {
 		if register_with_process {
 			process.threads.delete(process.threads.len - 1)
+			proc.thread_unref(t)
 		}
 		discard_unstarted_thread(t)
 		errno.set(errno.eagain)
@@ -606,6 +610,9 @@ pub fn discard_unstarted_thread(_thread &proc.Thread) {
 	mut t := unsafe { _thread }
 	if t.is_in_queue || t.running_on != u64(-1) {
 		panic('Attempted to discard a runnable thread')
+	}
+	if katomic.load(&t.descriptor_refs) != 1 {
+		panic('Attempted to discard a published Thread descriptor')
 	}
 
 	for stack_phys in t.stacks {

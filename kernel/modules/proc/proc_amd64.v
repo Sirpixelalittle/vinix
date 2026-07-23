@@ -16,6 +16,7 @@ pub mut:
 	syscall_num  u64
 	// Movable members
 	tid                int
+	descriptor_refs    u64
 	is_in_queue        bool
 	affinity           u64 = u64(-1)
 	l                  klock.Lock

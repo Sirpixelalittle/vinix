@@ -412,18 +412,22 @@ fn remove_itimer_process(process &proc.Process) {
 
 fn disarm_itimer_real(_process &proc.Process) {
 	mut process := unsafe { _process }
-	itimer_real_lock.acquire()
+	interrupts_were_enabled := itimer_real_lock.acquire_irqsave()
 	remove_itimer_process(process)
 	process.itimer_real_value_us = 0
 	process.itimer_real_interval_us = 0
-	itimer_real_lock.release()
+	itimer_real_lock.release_irqrestore(interrupts_were_enabled)
 }
 
 // Called from the 1 kHz PIT interrupt on AMD64.
 @[markused]
 pub fn tick_itimers() {
-	if !itimer_real_lock.test_and_acquire() {
+	acquired, interrupts_were_enabled := itimer_real_lock.try_acquire_irqsave()
+	if !acquired {
 		return
+	}
+	defer {
+		itimer_real_lock.release_irqrestore(interrupts_were_enabled)
 	}
 
 	for i := 0; i < max_itimer_real; i++ {
@@ -447,13 +451,12 @@ pub fn tick_itimers() {
 			itimer_real_processes[i] = unsafe { nil }
 		}
 
-		thrd := proc.first_thread(process)
+		thrd := proc.first_thread_ref(process)
 		if thrd != unsafe { nil } {
 			sendsig(thrd, u8(sigalrm))
+			proc.thread_unref(thrd)
 		}
 	}
-
-	itimer_real_lock.release()
 }
 
 pub fn syscall_getitimer(_ voidptr, which int, current &ITimerVal) (u64, u64) {
@@ -465,12 +468,12 @@ pub fn syscall_getitimer(_ voidptr, which int, current &ITimerVal) (u64, u64) {
 	}
 
 	mut process := proc.current_thread().process
-	itimer_real_lock.acquire()
+	interrupts_were_enabled := itimer_real_lock.acquire_irqsave()
 	unsafe {
 		current.it_value = us_to_timeval(process.itimer_real_value_us)
 		current.it_interval = us_to_timeval(process.itimer_real_interval_us)
 	}
-	itimer_real_lock.release()
+	itimer_real_lock.release_irqrestore(interrupts_were_enabled)
 	return 0, 0
 }
 
@@ -489,7 +492,7 @@ pub fn syscall_setitimer(_ voidptr, which int, new_value &ITimerVal, old_value &
 	interval_us := timeval_to_us(new_value.it_interval)
 	mut process := proc.current_thread().process
 
-	itimer_real_lock.acquire()
+	interrupts_were_enabled := itimer_real_lock.acquire_irqsave()
 	if old_value != unsafe { nil } {
 		unsafe {
 			old_value.it_value = us_to_timeval(process.itimer_real_value_us)
@@ -511,7 +514,7 @@ pub fn syscall_setitimer(_ voidptr, which int, new_value &ITimerVal, old_value &
 
 	if value_us > 0 && slot == -1 {
 		if free_slot == -1 {
-			itimer_real_lock.release()
+			itimer_real_lock.release_irqrestore(interrupts_were_enabled)
 			return errno.err, errno.eagain
 		}
 		slot = free_slot
@@ -522,7 +525,7 @@ pub fn syscall_setitimer(_ voidptr, which int, new_value &ITimerVal, old_value &
 
 	process.itimer_real_value_us = value_us
 	process.itimer_real_interval_us = interval_us
-	itimer_real_lock.release()
+	itimer_real_lock.release_irqrestore(interrupts_were_enabled)
 	return 0, 0
 }
 
@@ -630,7 +633,7 @@ pub fn signal_process_group(pgid int, signal int) bool {
 		if member == unsafe { nil } || member.pgid != pgid {
 			continue
 		}
-		thrd := proc.first_thread(member)
+		thrd := proc.first_thread_ref(member)
 		if thrd == unsafe { nil } {
 			continue
 		}
@@ -638,6 +641,7 @@ pub fn signal_process_group(pgid int, signal int) bool {
 		if signal != 0 {
 			sendsig(thrd, u8(signal))
 		}
+		proc.thread_unref(thrd)
 	}
 	return delivered
 }
@@ -664,13 +668,14 @@ pub fn syscall_kill(_ voidptr, pid int, signal int) (u64, u64) {
 		if target == unsafe { nil } {
 			return errno.err, errno.esrch
 		}
-		thrd := proc.first_thread(target)
+		thrd := proc.first_thread_ref(target)
 		if thrd == unsafe { nil } {
 			return errno.err, errno.esrch
 		}
 		if signal != 0 {
 			sendsig(thrd, u8(signal))
 		}
+		proc.thread_unref(thrd)
 		return 0, 0
 	}
 
@@ -686,10 +691,6 @@ pub fn syscall_kill(_ voidptr, pid int, signal int) (u64, u64) {
 		if target == unsafe { nil } {
 			continue
 		}
-		thrd := proc.first_thread(target)
-		if thrd == unsafe { nil } {
-			continue
-		}
 		if pid == -1 {
 			if target.pid == 1 {
 				continue
@@ -698,10 +699,15 @@ pub fn syscall_kill(_ voidptr, pid int, signal int) (u64, u64) {
 			continue
 		}
 
+		thrd := proc.first_thread_ref(target)
+		if thrd == unsafe { nil } {
+			continue
+		}
 		delivered = true
 		if signal != 0 {
 			sendsig(thrd, u8(signal))
 		}
+		proc.thread_unref(thrd)
 	}
 
 	if !delivered {
@@ -833,6 +839,7 @@ pub fn syscall_exit(_ voidptr, status int) {
 	disarm_itimer_real(current_process)
 
 	stop_process_siblings(current_process, current_thread)
+	detach_process_threads(current_process)
 
 	mut old_pagemap := current_process.pagemap
 
@@ -909,6 +916,7 @@ pub fn syscall_fork(gpr_state &cpulocal.GPRState) (u64, u64) {
 	mut new_thread := &proc.Thread{
 		gpr_state:      gpr_state
 		process:        new_process
+		descriptor_refs: 1
 		timeslice:      old_thread.timeslice
 		gs_base:        cpu.get_kernel_gs_base()
 		fs_base:        cpu.get_fs_base()
@@ -934,6 +942,7 @@ pub fn syscall_fork(gpr_state &cpulocal.GPRState) (u64, u64) {
 	old_process.children << new_process
 	new_process.threads_lock.acquire()
 	new_thread.tid = new_process.threads.len
+	proc.thread_ref(new_thread)
 	new_process.threads << new_thread
 	new_process.threads_lock.release()
 

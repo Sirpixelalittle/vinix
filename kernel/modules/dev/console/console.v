@@ -169,9 +169,7 @@ fn add_to_buf(mut terminal Console, ptr &u8, count u64, echo bool) {
 			if c == terminal.termios.c_cc[termios.vintr] {
 				if terminal.foreground_pgid == 0
 					|| !userland.signal_process_group(terminal.foreground_pgid, userland.sigint) {
-					if terminal.latest_thread != unsafe { nil } {
-						userland.sendsig(terminal.latest_thread, userland.sigint)
-					}
+					terminal.signal_latest_thread(userland.sigint)
 				}
 			}
 		}
@@ -582,18 +580,53 @@ pub mut:
 	status   int
 	can_mmap bool
 
-	index            int
-	context          voidptr
-	termios         termios.Termios
-	foreground_pgid int
-	read_lock        klock.Lock
-	input_event      eventstruct.Event
-	input_buffer     [console_buffer_size]u8
-	input_buffer_i   u64
-	read_buffer      [console_bigbuf_size]u8
-	read_buffer_i    u64
-	decckm           bool
-	latest_thread    &proc.Thread = unsafe { nil }
+	index              int
+	context            voidptr
+	termios            termios.Termios
+	foreground_pgid    int
+	read_lock          klock.Lock
+	input_event        eventstruct.Event
+	input_buffer       [console_buffer_size]u8
+	input_buffer_i     u64
+	read_buffer        [console_bigbuf_size]u8
+	read_buffer_i      u64
+	decckm             bool
+	latest_thread_lock klock.Lock
+	latest_thread      &proc.Thread = unsafe { nil }
+}
+
+fn (mut this Console) remember_thread(thrd &proc.Thread) {
+	if thrd == unsafe { nil } {
+		return
+	}
+
+	// Acquire before publication so an interrupt-side reader always observes
+	// a pointer backed by the console cache's own descriptor reference.
+	proc.thread_ref(thrd)
+	interrupts_were_enabled := this.latest_thread_lock.acquire_irqsave()
+	old_thread := this.latest_thread
+	unsafe {
+		this.latest_thread = thrd
+	}
+	this.latest_thread_lock.release_irqrestore(interrupts_were_enabled)
+
+	if old_thread != unsafe { nil } {
+		proc.thread_unref(old_thread)
+	}
+}
+
+fn (mut this Console) signal_latest_thread(signal int) {
+	interrupts_were_enabled := this.latest_thread_lock.acquire_irqsave()
+	thrd := this.latest_thread
+	if thrd != unsafe { nil } {
+		proc.thread_ref(thrd)
+	}
+	this.latest_thread_lock.release_irqrestore(interrupts_were_enabled)
+
+	if thrd != unsafe { nil } {
+		userland.sendsig(thrd, u8(signal))
+		proc.thread_unref(thrd)
+	}
 }
 
 fn (this Console) is_terminal() bool {
@@ -605,7 +638,7 @@ fn (mut this Console) mmap(page u64, flags int) voidptr {
 }
 
 fn (mut this Console) read(handle voidptr, void_buf voidptr, loc u64, count u64) ?i64 {
-	this.latest_thread = proc.current_thread()
+	this.remember_thread(proc.current_thread())
 
 	mut buf := unsafe { &u8(void_buf) }
 
@@ -663,7 +696,7 @@ fn (mut this Console) read(handle voidptr, void_buf voidptr, loc u64, count u64)
 }
 
 fn (mut this Console) write(handle voidptr, buf voidptr, loc u64, count u64) ?i64 {
-	this.latest_thread = proc.current_thread()
+	this.remember_thread(proc.current_thread())
 
 	copy := unsafe { malloc(count) }
 	defer {
@@ -675,7 +708,7 @@ fn (mut this Console) write(handle voidptr, buf voidptr, loc u64, count u64) ?i6
 }
 
 fn (mut this Console) ioctl(handle voidptr, request u64, argp voidptr) ?int {
-	this.latest_thread = proc.current_thread()
+	this.remember_thread(proc.current_thread())
 
 	match request {
 		ioctl.tiocsctty {
