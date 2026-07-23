@@ -18,12 +18,17 @@ pub const seat_cap_all = seat_cap_display | seat_cap_keyboard | seat_cap_pointer
 pub const seat_state_idle = u32(0)
 pub const seat_state_active = u32(1)
 pub const seat_state_revoked = u32(2)
+// A suspended lease remains bound to its terminal while another terminal is
+// active. Its mappings stay valid, but presentation and input are disabled.
+pub const seat_state_suspended = u32(3)
 
 pub const seat_event_acquired = u16(1)
 pub const seat_event_revoked = u16(2)
 pub const seat_event_released = u16(3)
 pub const seat_event_keyboard = u16(4)
 pub const seat_event_pointer = u16(5)
+pub const seat_event_suspended = u16(6)
+pub const seat_event_resumed = u16(7)
 
 pub const seat_source_system = u16(0)
 pub const seat_source_ps2_keyboard = u16(1)

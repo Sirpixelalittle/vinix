@@ -16,6 +16,7 @@ import stat
 import term
 
 const event_queue_size = 256
+const terminal_limit = 64
 
 struct SeatDevice {
 mut:
@@ -57,6 +58,7 @@ __global (
 	active_terminal_id      = u32(0)
 	active_terminal_context voidptr
 	next_generation         = u64(1)
+	terminal_leases         [terminal_limit]&SeatLease
 )
 
 fn queue_event_locked(mut lease SeatLease, seat_event ioctl.SeatEvent) {
@@ -82,7 +84,14 @@ fn state_event(kind u16, generation u64) ioctl.SeatEvent {
 	}
 }
 
-fn release_locked(mut lease SeatLease, revoked bool) {
+fn terminal_slot(terminal_id u32) int {
+	if terminal_id == 0 || terminal_id > u32(terminal_limit) {
+		return -1
+	}
+	return int(terminal_id - 1)
+}
+
+fn suspend_locked(mut lease SeatLease) {
 	if lease.state != ioctl.seat_state_active {
 		return
 	}
@@ -95,6 +104,52 @@ fn release_locked(mut lease SeatLease, revoked bool) {
 	if voidptr(active_lease) == voidptr(&lease) {
 		active_lease = unsafe { nil }
 	}
+	lease.state = ioctl.seat_state_suspended
+	lease.l.acquire()
+	queue_event_locked(mut lease, state_event(ioctl.seat_event_suspended,
+		lease.generation))
+	lease.l.release()
+}
+
+fn resume_locked(mut lease SeatLease, context voidptr) {
+	if lease.state != ioctl.seat_state_suspended {
+		return
+	}
+
+	lease.state = ioctl.seat_state_active
+	active_lease = &lease
+	if lease.capabilities & ioctl.seat_cap_display != 0 {
+		term.set_context_text_mode(context, false)
+		if lease.display_phys != unsafe { nil } {
+			term.present_framebuffer(voidptr(u64(lease.display_phys) + higher_half), 0,
+				0, 0, 0)
+		}
+	}
+	lease.l.acquire()
+	queue_event_locked(mut lease, state_event(ioctl.seat_event_resumed,
+		lease.generation))
+	lease.l.release()
+}
+
+fn release_locked(mut lease SeatLease, revoked bool) {
+	if lease.state != ioctl.seat_state_active
+		&& lease.state != ioctl.seat_state_suspended {
+		return
+	}
+
+	if lease.state == ioctl.seat_state_active
+		&& lease.capabilities & ioctl.seat_cap_display != 0
+		&& lease.terminal_id == active_terminal_id {
+		term.set_context_text_mode(active_terminal_context, true)
+	}
+
+	if voidptr(active_lease) == voidptr(&lease) {
+		active_lease = unsafe { nil }
+	}
+	slot := terminal_slot(lease.terminal_id)
+	if slot >= 0 && voidptr(terminal_leases[slot]) == voidptr(&lease) {
+		terminal_leases[slot] = unsafe { nil }
+	}
 	lease.state = if revoked { ioctl.seat_state_revoked } else { ioctl.seat_state_idle }
 	lease.l.acquire()
 	queue_event_locked(mut lease, state_event(if revoked {
@@ -103,12 +158,23 @@ fn release_locked(mut lease SeatLease, revoked bool) {
 		ioctl.seat_event_released
 	}, lease.generation))
 	lease.l.release()
+	lease.terminal_id = 0
+	lease.capabilities = 0
 }
 
 pub fn set_active_terminal(terminal_id u32, context voidptr) {
 	seat_lock.acquire()
+	if active_lease != unsafe { nil } && active_lease.terminal_id != terminal_id {
+		mut old_lease := active_lease
+		suspend_locked(mut old_lease)
+	}
 	active_terminal_id = terminal_id
 	active_terminal_context = context
+	slot := terminal_slot(terminal_id)
+	if slot >= 0 && terminal_leases[slot] != unsafe { nil } {
+		mut lease := terminal_leases[slot]
+		resume_locked(mut lease, context)
+	}
 	seat_lock.release()
 }
 
@@ -181,13 +247,14 @@ pub fn detach(token voidptr) {
 	lease.unref(unsafe { nil }) or {}
 }
 
-// Switching away is a forced revocation boundary. The old client retains its
-// private scanout allocation but can no longer present it or receive input.
-pub fn revoke_for_terminal_switch() {
+// Switching away suspends ownership. The client retains its terminal binding
+// and private scanout allocation, but cannot present or receive input until
+// that terminal becomes active again.
+pub fn suspend_for_terminal_switch() {
 	seat_lock.acquire()
 	if active_lease != unsafe { nil } {
 		mut lease := active_lease
-		release_locked(mut lease, true)
+		suspend_locked(mut lease)
 	}
 	seat_lock.release()
 }
@@ -364,9 +431,16 @@ fn (mut this SeatLease) ioctl(handle voidptr, request u64, argp voidptr) ?int {
 				errno.set(errno.ebusy)
 				return none
 			}
-			if acquire.terminal_id == 0 || acquire.terminal_id != active_terminal_id {
+			slot := terminal_slot(acquire.terminal_id)
+			if slot < 0 || acquire.terminal_id != active_terminal_id {
 				seat_lock.release()
 				errno.set(errno.eacces)
+				return none
+			}
+			if terminal_leases[slot] != unsafe { nil }
+				&& voidptr(terminal_leases[slot]) != voidptr(this) {
+				seat_lock.release()
+				errno.set(errno.ebusy)
 				return none
 			}
 			if this.state == ioctl.seat_state_active {
@@ -398,6 +472,7 @@ fn (mut this SeatLease) ioctl(handle voidptr, request u64, argp voidptr) ?int {
 			this.capabilities = acquire.capabilities
 			this.generation = next_generation
 			next_generation++
+			terminal_leases[slot] = &this
 			active_lease = &this
 			if this.capabilities & ioctl.seat_cap_display != 0 {
 				term.set_context_text_mode(active_terminal_context, false)
@@ -411,8 +486,8 @@ fn (mut this SeatLease) ioctl(handle voidptr, request u64, argp voidptr) ?int {
 		}
 		ioctl.seat_release {
 			seat_lock.acquire()
-			if voidptr(active_lease) != voidptr(this)
-				|| this.state != ioctl.seat_state_active {
+			if this.state != ioctl.seat_state_active
+				&& this.state != ioctl.seat_state_suspended {
 				seat_lock.release()
 				errno.set(errno.einval)
 				return none
@@ -429,7 +504,8 @@ fn (mut this SeatLease) ioctl(handle voidptr, request u64, argp voidptr) ?int {
 			seat_lock.acquire()
 			mut state := unsafe { &ioctl.SeatState(argp) }
 			state.state = this.state
-			state.terminal_id = if this.state == ioctl.seat_state_active {
+			state.terminal_id = if this.state == ioctl.seat_state_active
+				|| this.state == ioctl.seat_state_suspended {
 				this.terminal_id
 			} else {
 				active_terminal_id
@@ -500,14 +576,16 @@ fn (mut this SeatLease) ioctl(handle voidptr, request u64, argp voidptr) ?int {
 }
 
 fn (mut this SeatLease) unref(handle voidptr) ? {
-	// Closing the lease descriptor revokes ownership immediately. Memory maps
-	// retain their resource reference and therefore keep the private scanout
-	// allocation alive without retaining access to the physical display.
+	// Closing the lease descriptor revokes an active or suspended binding
+	// immediately. Memory maps retain their resource reference and therefore
+	// keep the private scanout allocation alive without retaining access to the
+	// physical display.
 	if handle != unsafe { nil } {
 		file_handle := unsafe { &file.Handle(handle) }
 		if katomic.load(&file_handle.descriptor_refcount) == 0 {
 			seat_lock.acquire()
-			if voidptr(active_lease) == voidptr(this) {
+			if this.state == ioctl.seat_state_active
+				|| this.state == ioctl.seat_state_suspended {
 				release_locked(mut this, true)
 			}
 			seat_lock.release()

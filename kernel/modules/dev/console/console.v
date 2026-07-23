@@ -197,7 +197,7 @@ fn switch_terminal(index int) bool {
 		return true
 	}
 
-	seat.revoke_for_terminal_switch()
+	seat.suspend_for_terminal_switch()
 	active_terminal_index = index
 	term.activate_context(target.context, true)
 	seat.set_active_terminal(u32(index + 1), target.context)
