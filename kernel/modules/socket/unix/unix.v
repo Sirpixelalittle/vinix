@@ -34,6 +34,7 @@ mut:
 __global (
 	abstract_sockets      [64]AbstractSocketEntry
 	abstract_sockets_lock klock.Lock
+	unix_connection_lock  klock.Lock
 )
 
 pub struct UnixSocket {
@@ -51,6 +52,10 @@ pub mut:
 
 	connection_event eventstruct.Event
 	connected        bool
+	peer_closed      bool
+	closed           bool
+	connect_error    u64
+	abstract_bound   bool
 	peer             &UnixSocket = unsafe { nil }
 
 	data      &u8 = unsafe { nil }
@@ -76,10 +81,15 @@ fn (mut this UnixSocket) read(_handle voidptr, buf voidptr, loc u64, _count u64)
 
 	// If pipe is empty, block or return if nonblock
 	for katomic.load(&this.used) == 0 {
-		// Return EOF if the pipe was closed
-		//		if this.refcount <= 1 {
-		//			return 0
-		//		}
+		// A disconnected stream remains readable and returns EOF. This is what
+		// lets poll-driven servers tear down all state owned by a dead client.
+		if this.peer_closed {
+			return 0
+		}
+		if !this.connected {
+			errno.set(errno.enotconn)
+			return none
+		}
 		if handle.flags & resource.o_nonblock != 0 {
 			errno.set(errno.ewouldblock)
 			return none
@@ -124,10 +134,14 @@ fn (mut this UnixSocket) read(_handle voidptr, buf voidptr, loc u64, _count u64)
 	this.read_ptr = new_ptr_loc
 	this.used -= count
 
-	this.peer.status |= file.pollout
-	event.trigger(mut this.peer.event, false)
+	if this.peer != unsafe { nil } {
+		this.peer.status |= file.pollout
+		event.trigger(mut this.peer.event, false)
+	}
 
-	this.status &= ~file.pollin
+	if this.used == 0 && !this.peer_closed {
+		this.status &= ~file.pollin
+	}
 
 	return i64(count)
 }
@@ -135,9 +149,22 @@ fn (mut this UnixSocket) read(_handle voidptr, buf voidptr, loc u64, _count u64)
 fn (mut this UnixSocket) write(_handle voidptr, buf voidptr, loc u64, _count u64) ?i64 {
 	mut count := _count
 
-	mut peer := this.peer
+	interrupts_were_enabled := unix_connection_lock.acquire_irqsave()
+	if !this.connected || this.peer_closed || this.peer == unsafe { nil } {
+		unix_connection_lock.release_irqrestore(interrupts_were_enabled)
+		errno.set(errno.epipe)
+		return none
+	}
 
+	mut peer := this.peer
 	peer.l.acquire()
+	if peer.closed || peer.peer_closed || peer.peer == unsafe { nil } {
+		peer.l.release()
+		unix_connection_lock.release_irqrestore(interrupts_were_enabled)
+		errno.set(errno.epipe)
+		return none
+	}
+	unix_connection_lock.release_irqrestore(interrupts_were_enabled)
 	defer {
 		peer.l.release()
 	}
@@ -146,6 +173,10 @@ fn (mut this UnixSocket) write(_handle voidptr, buf voidptr, loc u64, _count u64
 
 	// If pipe is full, block or return if nonblock
 	for katomic.load(&peer.used) == peer.capacity {
+		if peer.closed || voidptr(peer.peer) != voidptr(this) {
+			errno.set(errno.epipe)
+			return none
+		}
 		if handle.flags & resource.o_nonblock != 0 {
 			errno.set(errno.ewouldblock)
 			return none
@@ -160,6 +191,10 @@ fn (mut this UnixSocket) write(_handle voidptr, buf voidptr, loc u64, _count u64
 		}
 		unsafe { events.free() }
 		peer.l.acquire()
+	}
+	if peer.closed || voidptr(peer.peer) != voidptr(this) {
+		errno.set(errno.epipe)
+		return none
 	}
 
 	if peer.used + count > peer.capacity {
@@ -223,8 +258,97 @@ fn (mut this UnixSocket) ioctl(handle voidptr, request u64, argp voidptr) ?int {
 	}
 }
 
-fn (mut this UnixSocket) unref(handle voidptr) ? {
-	return none
+fn (mut this UnixSocket) unref(_handle voidptr) ? {
+	katomic.dec(mut &this.refcount)
+
+	// Temporary FD references never reach the resource. A resource unref with
+	// a live descriptor count is therefore a non-final duplicate close.
+	if _handle == unsafe { nil } {
+		return
+	}
+	handle := unsafe { &file.Handle(_handle) }
+	if katomic.load(&handle.descriptor_refcount) != 0 {
+		return
+	}
+
+	mut peer := &UnixSocket(unsafe { nil })
+	mut rejected := []&UnixSocket{}
+	mut data_to_free := &u8(unsafe { nil })
+	interrupts_were_enabled := unix_connection_lock.acquire_irqsave()
+	this.l.acquire()
+	if this.closed {
+		this.l.release()
+		unix_connection_lock.release_irqrestore(interrupts_were_enabled)
+		unsafe {
+			rejected.free()
+		}
+		return
+	}
+
+	this.closed = true
+	this.listening = false
+	this.status &= ~file.pollout
+	this.status |= file.pollhup | file.pollrdhup
+
+	peer = this.peer
+	if peer != unsafe { nil } {
+		peer.l.acquire()
+		if voidptr(peer.peer) == voidptr(this) {
+			peer.peer = unsafe { nil }
+			peer.connected = false
+			peer.peer_closed = true
+			peer.status &= ~file.pollout
+			// EOF is readable, and HUP must be reported even if the caller
+			// requested only POLLIN.
+			peer.status |= file.pollin | file.pollhup | file.pollrdhup
+		}
+		peer.l.release()
+	}
+	this.peer = unsafe { nil }
+	this.connected = false
+	data_to_free = this.data
+	this.data = unsafe { nil }
+	this.capacity = 0
+	this.used = 0
+	this.read_ptr = 0
+	this.write_ptr = 0
+
+	for this.backlog.len > 0 {
+		mut pending := this.backlog.pop()
+		pending.connect_error = errno.econnrefused
+		rejected << pending
+	}
+	this.status &= ~file.pollin
+	this.l.release()
+	unix_connection_lock.release_irqrestore(interrupts_were_enabled)
+
+	if peer != unsafe { nil } {
+		event.trigger(mut peer.event, false)
+	}
+	for mut pending in rejected {
+		event.trigger(mut pending.connection_event, false)
+	}
+	unsafe {
+		rejected.free()
+		if data_to_free != nil {
+			free(data_to_free)
+		}
+	}
+
+	if this.abstract_bound {
+		abstract_interrupts_were_enabled := abstract_sockets_lock.acquire_irqsave()
+		for i := 0; i < abstract_sockets.len; i++ {
+			if abstract_sockets[i].in_use
+				&& voidptr(abstract_sockets[i].socket) == voidptr(this) {
+				abstract_sockets[i].in_use = false
+				abstract_sockets[i].name_len = 0
+				abstract_sockets[i].socket = unsafe { nil }
+				break
+			}
+		}
+		this.abstract_bound = false
+		abstract_sockets_lock.release_irqrestore(abstract_interrupts_were_enabled)
+	}
 }
 
 fn (mut this UnixSocket) link(handle voidptr) ? {
@@ -257,7 +381,7 @@ fn (mut this UnixSocket) peername(handle voidptr, _addr voidptr, addrlen &u32) ?
 }
 
 fn (mut this UnixSocket) accept(_handle voidptr) ?&resource.Resource {
-	if this.listening == false {
+	if this.listening == false || this.closed {
 		errno.set(errno.einval)
 		return none
 	}
@@ -270,6 +394,10 @@ fn (mut this UnixSocket) accept(_handle voidptr) ?&resource.Resource {
 	handle := unsafe { &file.Handle(_handle) }
 
 	for this.backlog.len == 0 {
+		if this.closed || !this.listening {
+			errno.set(errno.econnaborted)
+			return none
+		}
 		this.status &= ~file.pollin
 		if handle.flags & resource.o_nonblock != 0 {
 			errno.set(errno.ewouldblock)
@@ -298,11 +426,15 @@ fn (mut this UnixSocket) accept(_handle voidptr) ?&resource.Resource {
 		name:      peer.name
 		data:      unsafe { malloc(sock_buf) }
 		capacity:  sock_buf
+		status:    file.pollout
 	}
 
-	peer.refcount++
+	interrupts_were_enabled := unix_connection_lock.acquire_irqsave()
 	peer.peer = connection_socket
 	peer.connected = true
+	peer.peer_closed = false
+	peer.connect_error = 0
+	unix_connection_lock.release_irqrestore(interrupts_were_enabled)
 
 	if this.backlog.len == 0 {
 		this.status &= ~file.pollin
@@ -336,7 +468,7 @@ fn (mut this UnixSocket) connect(handle voidptr, _addr voidptr, addrlen u32) ? {
 	// Abstract socket: sun_path[0] == '\0'
 	if addrlen > 2 && addr.sun_path[0] == 0 {
 		name_len := addrlen - 2
-		abstract_sockets_lock.acquire()
+		interrupts_were_enabled := abstract_sockets_lock.acquire_irqsave()
 		for i in 0 .. 64 {
 			if abstract_sockets[i].in_use && abstract_sockets[i].name_len == name_len {
 				if unsafe { C.memcmp(&abstract_sockets[i].name[0], &addr.sun_path[0], name_len) } == 0 {
@@ -345,7 +477,7 @@ fn (mut this UnixSocket) connect(handle voidptr, _addr voidptr, addrlen u32) ? {
 				}
 			}
 		}
-		abstract_sockets_lock.release()
+		abstract_sockets_lock.release_irqrestore(interrupts_were_enabled)
 		if socket == unsafe { nil } {
 			errno.set(errno.econnrefused)
 			return none
@@ -368,13 +500,14 @@ fn (mut this UnixSocket) connect(handle voidptr, _addr voidptr, addrlen u32) ? {
 		}
 	}
 
-	if socket.listening == false {
+	socket.l.acquire()
+	if socket.closed || !socket.listening {
+		socket.l.release()
 		errno.set(errno.econnrefused)
 		return none
 	}
 
-	socket.l.acquire()
-
+	this.connect_error = 0
 	socket.backlog << this
 
 	socket.status |= file.pollin
@@ -384,12 +517,27 @@ fn (mut this UnixSocket) connect(handle voidptr, _addr voidptr, addrlen u32) ? {
 
 	mut events := [&this.connection_event]
 	event.await(mut events, true) or {
+		socket.l.acquire()
+		for i, pending in socket.backlog {
+			if voidptr(pending) == voidptr(this) {
+				socket.backlog.delete(i)
+				if socket.backlog.len == 0 {
+					socket.status &= ~file.pollin
+				}
+				break
+			}
+		}
+		socket.l.release()
 		unsafe { events.free() }
 		errno.set(errno.eintr)
 		return none
 	}
 	unsafe { events.free() }
 
+	if !this.connected {
+		errno.set(if this.connect_error != 0 { this.connect_error } else { errno.econnrefused })
+		return none
+	}
 	this.status |= file.pollout
 	event.trigger(mut this.event, false)
 }
@@ -413,9 +561,9 @@ fn (mut this UnixSocket) bind(handle voidptr, _addr voidptr, addrlen u32) ? {
 	// Abstract socket: sun_path[0] == '\0', name is in sun_path[1..addrlen-2]
 	if addrlen > 2 && addr.sun_path[0] == 0 {
 		name_len := addrlen - 2 // subtract sizeof(sun_family)
-		abstract_sockets_lock.acquire()
+		interrupts_were_enabled := abstract_sockets_lock.acquire_irqsave()
 		defer {
-			abstract_sockets_lock.release()
+			abstract_sockets_lock.release_irqrestore(interrupts_were_enabled)
 		}
 		// Check for duplicate
 		for i in 0 .. 64 {
@@ -433,6 +581,7 @@ fn (mut this UnixSocket) bind(handle voidptr, _addr voidptr, addrlen u32) ? {
 				abstract_sockets[i].name_len = name_len
 				unsafe { C.memcpy(&abstract_sockets[i].name[0], &addr.sun_path[0], name_len) }
 				abstract_sockets[i].socket = unsafe { this }
+				this.abstract_bound = true
 				this.name = *addr
 				return
 			}
@@ -482,12 +631,21 @@ fn (mut this UnixSocket) recvmsg(_handle voidptr, msg &sock_pub.MsgHdr, flags in
 
 	// If pipe is empty, block or return if nonblock
 	for katomic.load(&this.used) == 0 {
-		// Return EOF if the pipe was closed
-		//		if this.refcount <= 1 {
-		//			return 0
-		//		}
-		this.peer.status |= file.pollout
-		event.trigger(mut this.peer.event, false)
+		if this.peer_closed {
+			unsafe {
+				msg.msg_controllen = 0
+				msg.msg_flags = 0
+			}
+			return 0
+		}
+		if !this.connected {
+			errno.set(errno.enotconn)
+			return none
+		}
+		if this.peer != unsafe { nil } {
+			this.peer.status |= file.pollout
+			event.trigger(mut this.peer.event, false)
+		}
 		if handle.flags & resource.o_nonblock != 0 {
 			errno.set(errno.ewouldblock)
 			return none
@@ -550,8 +708,10 @@ fn (mut this UnixSocket) recvmsg(_handle voidptr, msg &sock_pub.MsgHdr, flags in
 	this.read_ptr = new_ptr_loc
 	this.used -= transferred
 
-	this.peer.status |= file.pollout
-	event.trigger(mut this.peer.event, false)
+	if this.peer != unsafe { nil } {
+		this.peer.status |= file.pollout
+		event.trigger(mut this.peer.event, false)
+	}
 
 	if msg.msg_name != unsafe { nil } && this.connected {
 		buffer_size := msg.msg_namelen
@@ -574,7 +734,9 @@ fn (mut this UnixSocket) recvmsg(_handle voidptr, msg &sock_pub.MsgHdr, flags in
 
 	C.printf(c'Successfully received %llu bytes\n', transferred)
 
-	this.status &= ~file.pollin
+	if this.used == 0 && !this.peer_closed {
+		this.status &= ~file.pollin
+	}
 
 	return transferred
 }
@@ -593,17 +755,21 @@ pub fn create(@type int) ?&UnixSocket {
 pub fn create_pair(@type int) ?(&UnixSocket, &UnixSocket) {
 	mut a := &UnixSocket{
 		refcount: 1
-		peer:     unsafe { nil }
 		data:     unsafe { malloc(sock_buf) }
 		capacity: sock_buf
+		connected: true
+		status:    file.pollout
 	}
 	a.name.sun_family = sock_pub.af_unix
 	mut b := &UnixSocket{
 		refcount: 1
-		peer:     unsafe { nil }
 		data:     unsafe { malloc(sock_buf) }
 		capacity: sock_buf
+		connected: true
+		status:    file.pollout
 	}
 	b.name.sun_family = sock_pub.af_unix
+	a.peer = b
+	b.peer = a
 	return a, b
 }

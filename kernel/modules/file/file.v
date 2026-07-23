@@ -60,6 +60,7 @@ pub const pollerr = 0x08
 pub const pollrdhup = 0x2000
 pub const pollnval = 0x20
 pub const pollwrnorm = 0x100
+const poll_always_report = pollerr | pollhup | pollnval
 
 pub fn syscall_ppoll(_ voidptr, fds &PollFD, nfds u64, tmo_p &time.TimeSpec, sigmask &u64) (u64, u64) {
 	mut t := proc.current_thread()
@@ -123,8 +124,9 @@ pub fn syscall_ppoll(_ voidptr, fds &PollFD, nfds u64, tmo_p &time.TimeSpec, sig
 
 		status := resource_.status
 
-		if i16(status) & fdd.events != 0 {
-			fdd.revents = i16(status) & fdd.events
+		ready_events := i16(status) & (fdd.events | i16(poll_always_report))
+		if ready_events != 0 {
+			fdd.revents = ready_events
 			C.printf(c'Poll detected event on fdnum %d, events %llx\n', fdd.fd, fdd.events)
 			ret++
 			fd.unref()
@@ -170,11 +172,11 @@ pub fn syscall_ppoll(_ voidptr, fds &PollFD, nfds u64, tmo_p &time.TimeSpec, sig
 
 		mut fdd := unsafe { &fds[fdnums[which]] }
 
-		if i16(status) & fdd.events != 0 {
+		ready_events := i16(status) & (fdd.events | i16(poll_always_report))
+		if ready_events != 0 {
 			C.printf(c'Poll exiting on fdnum %d, events %llx\n', fdd.fd, fdd.events)
 
-			fdd.revents = 0
-			fdd.revents = i16(status) & fdd.events
+			fdd.revents = ready_events
 			ret++
 			break
 		}
