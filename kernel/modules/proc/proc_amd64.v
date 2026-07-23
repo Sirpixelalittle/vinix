@@ -17,6 +17,7 @@ pub mut:
 	// Movable members
 	tid                int
 	is_in_queue        bool
+	affinity           u64 = u64(-1)
 	l                  klock.Lock
 	process            &Process = unsafe { nil }
 	gpr_state          cpulocal.GPRState

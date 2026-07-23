@@ -1,13 +1,26 @@
 module pci
 
 import x86.kio
+import klock
+
+__global (
+	pci_config_lock klock.Lock
+)
 
 pub fn (dev &PCIDevice) read[T](offset u32) T {
+	pci_config_lock.acquire()
+	defer {
+		pci_config_lock.release()
+	}
 	dev.get_address(offset)
 	return kio.port_in[T](u16(0xcfc + (offset & 3)))
 }
 
 pub fn (dev &PCIDevice) write[T](offset u32, value T) {
+	pci_config_lock.acquire()
+	defer {
+		pci_config_lock.release()
+	}
 	dev.get_address(offset)
 	kio.port_out[T](u16(0xcfc + (offset & 3)), value)
 }

@@ -177,6 +177,7 @@ override CPPFLAGS += -D__vinix__
 ifeq ($(ARCH),aarch64)
 override VFILES := $(shell find -L * -type f -name '*.v' \
     ! -path 'obj/*' \
+    ! -path '.vbuild/*' \
     ! -path 'modules/x86/*' \
     ! -path 'modules/acpi/*' \
     ! -path 'modules/uacpi/*' \
@@ -202,6 +203,7 @@ override ASFILES := $(shell cd asm && find -L * -type f -name '*.S' \
 else
 override VFILES := $(shell find -L * -type f -name '*.v' \
     ! -path 'obj/*' \
+    ! -path '.vbuild/*' \
     ! -path 'modules/aarch64/*' \
     ! -path 'modules/apple/*' \
     ! -path 'modules/devicetree/*' \
@@ -248,12 +250,12 @@ endif
 
 obj/blob.c.o: GNUmakefile $(VFILES)
 	mkdir -p "$$(dirname $@)"
-	rm -rf obj/vsrc
-	for f in $(VFILES); do mkdir -p "obj/vsrc/$$(dirname $$f)" && ln -sf "$(CURDIR)/$$f" "obj/vsrc/$$f"; done
-	$(V) $(VFLAGS) -o obj/blob.c obj/vsrc
-	sed 's/call 0(/call *(/g;/Wimplicit-function-declaration/d' < obj/blob.c > obj/blob.c.tmp
-	mv obj/blob.c.tmp obj/blob.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) -w -c obj/blob.c -o $@
+	rm -rf .vbuild/vsrc
+	for f in $(VFILES); do mkdir -p ".vbuild/vsrc/$$(dirname $$f)" && ln -sf "$(CURDIR)/$$f" ".vbuild/vsrc/$$f"; done
+	$(V) $(VFLAGS) -o .vbuild/blob.c .vbuild/vsrc
+	sed 's/call 0(/call *(/g;/Wimplicit-function-declaration/d' < .vbuild/blob.c > .vbuild/blob.c.tmp
+	mv .vbuild/blob.c.tmp .vbuild/blob.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -w -c .vbuild/blob.c -o $@
 
 # Compilation rules for *.c files.
 obj/%.c.o: c/%.c GNUmakefile
@@ -268,7 +270,7 @@ obj/%.S.o: asm/%.S GNUmakefile
 # Remove object files and the final executable.
 .PHONY: clean
 clean:
-	rm -rf bin obj cc-runtime-x86_64 cc-runtime-aarch64
+	rm -rf bin obj .vbuild cc-runtime-x86_64 cc-runtime-aarch64
 
 # Remove everything built and generated including downloaded dependencies.
 .PHONY: distclean

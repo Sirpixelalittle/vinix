@@ -43,7 +43,7 @@ fn get_next_thread() &proc.Thread {
 
 		mut t := scheduler_running_queue[index]
 
-		if unsafe { t != 0 } {
+		if unsafe { t != 0 } && (t.affinity == u64(-1) || t.affinity == cpu_local.cpu_number) {
 			if t.l.test_and_acquire() == true {
 				cpu_local.last_run_queue_index = index
 				return t
@@ -415,7 +415,7 @@ pub fn new_user_thread(_process &proc.Process, want_elf bool, pc voidptr, arg vo
 		mmap.map_range(mut process.pagemap, stack_bottom_vma, u64(stack_phys), stack_size,
 			mmap.prot_read | mmap.prot_write, mmap.map_anonymous) or { return none }
 	} else {
-		stack = &u64(voidptr(_stack))
+		stack = unsafe { &u64(voidptr(_stack)) }
 		stack_vma = _stack
 	}
 

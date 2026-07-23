@@ -181,16 +181,28 @@ pub fn io_apic_set_gsi_redirect(lapic_id u32, vector u8, gsi u32, flags u16, sta
 	io_apic_write(io_apic, ioredtbl + 1, u32(redirect >> 32))
 }
 
-pub fn io_apic_set_irq_redirect(lapic_id u32, vector u8, irq u8, status bool) {
+fn io_apic_irq_to_gsi(irq u32) (u32, u16) {
 	for i := 0; i < madt_isos.len; i++ {
-		if madt_isos[i].irq_source == irq {
-			if status {
-				print('apic: IRQ ${irq} using override\n')
-			}
-			io_apic_set_gsi_redirect(lapic_id, vector, madt_isos[i].gsi, madt_isos[i].flags,
-				status)
-			return
+		if u32(madt_isos[i].irq_source) == irq {
+			return madt_isos[i].gsi, madt_isos[i].flags
 		}
 	}
-	io_apic_set_gsi_redirect(lapic_id, vector, irq, 0, status)
+	return irq, 0
+}
+
+pub fn io_apic_can_route_irq(irq u32) bool {
+	gsi, _ := io_apic_irq_to_gsi(irq)
+	return io_apic_from_gsi(gsi) >= 0
+}
+
+pub fn io_apic_set_irq_redirect_u32(lapic_id u32, vector u8, irq u32, status bool) {
+	gsi, flags := io_apic_irq_to_gsi(irq)
+	if status && gsi != irq {
+		print('apic: IRQ ${irq} using override\n')
+	}
+	io_apic_set_gsi_redirect(lapic_id, vector, gsi, flags, status)
+}
+
+pub fn io_apic_set_irq_redirect(lapic_id u32, vector u8, irq u8, status bool) {
+	io_apic_set_irq_redirect_u32(lapic_id, vector, u32(irq), status)
 }

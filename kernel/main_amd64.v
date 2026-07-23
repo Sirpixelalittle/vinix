@@ -48,9 +48,10 @@ __global (
 
 struct BootOptions {
 mut:
-	root       string
-	rootfstype string = 'ext2'
-	read_only  bool
+	root            string
+	rootfstype      string = 'ext2'
+	read_only       bool
+	uacpi_self_test bool
 }
 
 fn parse_boot_options() BootOptions {
@@ -75,6 +76,8 @@ fn parse_boot_options() BootOptions {
 			options.read_only = true
 		} else if argument == 'rw' {
 			options.read_only = false
+		} else if argument == 'uacpi.selftest' || argument == 'uacpi.selftest=1' {
+			options.uacpi_self_test = true
 		}
 	}
 	return options
@@ -148,6 +151,12 @@ fn mount_real_root(options BootOptions) bool {
 }
 
 fn kmain_thread() {
+	boot_options := parse_boot_options()
+	uacpi.initialise()
+	if boot_options.uacpi_self_test {
+		uacpi.run_self_tests()
+	}
+
 	term.framebuffer_init()
 
 	table.init_syscall_table()
@@ -161,7 +170,6 @@ fn kmain_thread() {
 	fs.create(vfs_root, '/dev', 0o644 | stat.ifdir) or {}
 	fs.mount(vfs_root, '', '/dev', 'devtmpfs') or {}
 
-	boot_options := parse_boot_options()
 	if boot_options.root.len == 0 {
 		initramfs.initialise()
 	}
@@ -224,28 +232,6 @@ fn kmain() {
 	hpet.initialise()
 
 	pci.initialise()
-
-	mut uacpi_status := uacpi.UACPIStatus.ok
-
-	uacpi_status = C.uacpi_initialize(0)
-	if uacpi_status != uacpi.UACPIStatus.ok {
-		panic('uacpi_initialize(): ${C.uacpi_status_to_string(uacpi_status)}')
-	}
-
-	uacpi_status = C.uacpi_namespace_load()
-	if uacpi_status != uacpi.UACPIStatus.ok {
-		panic('uacpi_namespace_load(): ${C.uacpi_status_to_string(uacpi_status)}')
-	}
-
-	uacpi_status = C.uacpi_set_interrupt_model(uacpi.InterruptModel.ioapic)
-	if uacpi_status != uacpi.UACPIStatus.ok {
-		panic('uacpi_interrupt_model(): ${C.uacpi_status_to_string(uacpi_status)}')
-	}
-
-	uacpi_status = C.uacpi_namespace_initialize()
-	if uacpi_status != uacpi.UACPIStatus.ok {
-		panic('uacpi_namespace_initialize(): ${C.uacpi_status_to_string(uacpi_status)}')
-	}
 
 	smp.initialise()
 

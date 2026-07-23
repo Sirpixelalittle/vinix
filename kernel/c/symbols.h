@@ -20,6 +20,15 @@ static inline void vinix_call_void_fn(void *fn) {
     ((void (*)(void))fn)();
 }
 
+/* Helpers for invoking opaque callbacks owned by host interfaces. */
+static inline void vinix_call_void_fn_with_arg(void *fn, void *arg) {
+    ((void (*)(void *))fn)(arg);
+}
+
+static inline unsigned int vinix_call_u32_fn_with_arg(void *fn, void *arg) {
+    return ((unsigned int (*)(void *))fn)(arg);
+}
+
 /* Read current SP (V's inline asm can't handle sp register) */
 static inline unsigned long read_current_sp(void) {
     unsigned long sp;
