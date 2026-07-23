@@ -39,6 +39,13 @@ pub mut:
 	pending_signals    u64
 	masked_signals     u64
 	enqueued_by_signal bool
+	terminating        bool
+	terminated         bool
+	retirement_queued  bool
+	runtime_quiesced   bool
+	runtime_reclaimed  bool
+	retire_cpu         u64
+	retire_epoch       u64
 	stacks             []voidptr
 	signalfds_lock     klock.Lock
 	signalfds          []voidptr

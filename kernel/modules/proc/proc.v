@@ -18,6 +18,7 @@ pub mut:
 	sid                      int
 	pagemap                  &memory.Pagemap = unsafe { nil }
 	thread_stack_top         u64
+	threads_lock             klock.Lock
 	threads                  []&Thread
 	fds_lock                 klock.Lock
 	fds                      [max_fds]voidptr
@@ -30,7 +31,22 @@ pub mut:
 	name                     string
 	itimer_real_value_us     i64
 	itimer_real_interval_us  i64
+	execing                  bool
 	exiting                  bool
+}
+
+// Return a stable thread pointer without exposing the Process.threads array
+// while another CPU may replace its backing storage during exec.
+pub fn first_thread(_process &Process) &Thread {
+	mut process := unsafe { _process }
+	process.threads_lock.acquire()
+	defer {
+		process.threads_lock.release()
+	}
+	if process.threads.len == 0 {
+		return unsafe { nil }
+	}
+	return process.threads[0]
 }
 
 pub struct SigAction {

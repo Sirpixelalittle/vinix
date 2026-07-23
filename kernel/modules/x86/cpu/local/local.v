@@ -61,6 +61,7 @@ pub mut:
 	online               u64
 	is_idle              bool
 	last_run_queue_index int
+	switch_count         u64
 	abort_stack          [abort_stack_size]u64
 	aborted              bool
 }

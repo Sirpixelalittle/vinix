@@ -17,11 +17,15 @@ import time
 
 fn C.sched_switch_context(gpr_state &cpulocal.GPRState, kernel_stack u64)
 fn C.vinix_call_void_fn(f voidptr)
+fn C.userland__current_thread_is_terminating() bool
+fn C.userland__terminate_current_thread()
 
 pub fn initialise() {
 	kernel_process = &proc.Process{
 		pagemap: &kernel_pagemap
 	}
+	retired_thread_reaper = new_kernel_thread(voidptr(retired_thread_reaper_main),
+		unsafe { nil }, true)
 
 	println('sched: ARM64 scheduler initialised')
 }
@@ -86,6 +90,7 @@ fn scheduler_timer_handler(_gpr_state voidptr) {
 
 	mut cpu_local := cpulocal.current()
 	katomic.store(mut &cpu_local.is_idle, false)
+	mark_retired_threads_quiescent(cpu_local.cpu_number, cpu_local.switch_count)
 
 	mut current_thread := proc.current_thread()
 	mut next_thread := get_next_thread()
@@ -99,6 +104,10 @@ fn scheduler_timer_handler(_gpr_state voidptr) {
 			// Either way, return without modifying thread state — the
 			// caller (yield_dispatch or interrupt) continues running.
 			if current_thread.is_in_queue {
+				if unsafe { _gpr_state != nil } && gpr_state.pstate & 0xf == 0
+					&& C.userland__current_thread_is_terminating() {
+					C.userland__terminate_current_thread()
+				}
 				timer.oneshot(current_thread.timeslice)
 			}
 			return
@@ -136,6 +145,12 @@ fn scheduler_timer_handler(_gpr_state voidptr) {
 
 	current_thread = next_thread
 	proc.set_current_thread(cpu_local.cpu_number, current_thread)
+	cpu_local.switch_count++
+
+	if current_thread.gpr_state.pstate & 0xf == 0
+		&& C.userland__current_thread_is_terminating() {
+		C.userland__terminate_current_thread()
+	}
 
 	cpu.write_tpidr_el0(current_thread.tpidr_el0)
 
@@ -162,6 +177,9 @@ fn scheduler_timer_handler(_gpr_state voidptr) {
 pub fn enqueue_thread(_thread &proc.Thread, by_signal bool) bool {
 	mut t := unsafe { _thread }
 
+	if katomic.load(&t.terminated) {
+		return false
+	}
 	if t.is_in_queue == true {
 		return true
 	}
@@ -204,6 +222,11 @@ pub fn dequeue_thread(_thread &proc.Thread) bool {
 	}
 
 	return false
+}
+
+pub fn detach_thread_address_space(_thread &proc.Thread) {
+	mut t := unsafe { _thread }
+	t.ttbr0 = u64(kernel_process.pagemap.top_level)
 }
 
 pub fn intercept_thread(_thread &proc.Thread) ? {
@@ -302,9 +325,10 @@ pub fn dequeue_and_die() {
 	cpu.interrupt_toggle(false)
 	mut t := proc.current_thread()
 	dequeue_thread(t)
+	mut cpu_local := cpulocal.current()
+	retire_current_thread(t, cpu_local.cpu_number, cpu_local.switch_count)
 	// Clear current thread so the scheduler timer handler knows
 	// there is no running thread to save state from.
-	mut cpu_local := cpulocal.current()
 	proc.set_current_thread(cpu_local.cpu_number, unsafe { nil })
 	yield(false)
 	for {}
@@ -335,8 +359,6 @@ pub fn new_kernel_thread(pc voidptr, arg voidptr, autoenqueue bool) &proc.Thread
 			higher_half)
 	}
 
-	unsafe { stacks.free() }
-
 	t.self = voidptr(t)
 
 	if autoenqueue == true {
@@ -360,20 +382,44 @@ pub fn syscall_new_thread(_ voidptr, pc voidptr, stack u64) (u64, u64) {
 		unsafe { empty_string_array.free() }
 	}
 
-	mut new_thread := new_user_thread(process, false, pc, unsafe { nil }, stack, empty_string_array,
-		empty_string_array, unsafe { nil }, false) or { return errno.err, errno.get() }
+	mut new_thread := new_user_thread(process, false, pc, unsafe { nil }, stack,
+		empty_string_array, empty_string_array, unsafe { nil }, false, true) or {
+		return errno.err, errno.get()
+	}
 
 	enqueue_thread(new_thread, false)
 
 	return u64(new_thread.tid + 1), 0
 }
 
-pub fn new_user_thread(_process &proc.Process, want_elf bool, pc voidptr, arg voidptr, _stack u64, argv []string, envp []string, auxval &elf.Auxval, autoenqueue bool) ?&proc.Thread {
+pub fn new_user_thread(_process &proc.Process, want_elf bool, pc voidptr, arg voidptr,
+	_stack u64, argv []string, envp []string, auxval &elf.Auxval, autoenqueue bool,
+	register_with_process bool) ?&proc.Thread {
 	mut process := unsafe { _process }
 
-	mut stacks := []voidptr{}
+	if autoenqueue && !register_with_process {
+		panic('Cannot enqueue an unregistered user thread')
+	}
+	if register_with_process {
+		process.threads_lock.acquire()
+		if process.execing || katomic.load(&process.exiting) {
+			process.threads_lock.release()
+			errno.set(errno.eagain)
+			return none
+		}
+	}
 	defer {
-		unsafe { stacks.free() }
+		if register_with_process {
+			process.threads_lock.release()
+		}
+	}
+
+	mut stacks := []voidptr{}
+	mut stacks_transferred := false
+	defer {
+		if !stacks_transferred {
+			unsafe { stacks.free() }
+		}
 	}
 
 	mut stack := unsafe { &u64(0) }
@@ -417,6 +463,7 @@ pub fn new_user_thread(_process &proc.Process, want_elf bool, pc voidptr, arg vo
 		fpu_storage:  voidptr(u64(memory.pmm_alloc(lib.div_roundup(fpu_storage_size, page_size))) +
 			higher_half)
 	}
+	stacks_transferred = true
 
 	t.self = voidptr(t)
 	t.tpidr_el0 = u64(0)
@@ -529,14 +576,41 @@ pub fn new_user_thread(_process &proc.Process, want_elf bool, pc voidptr, arg vo
 		}
 	}
 
-	if autoenqueue == true {
-		enqueue_thread(t, false)
+	if register_with_process {
+		t.tid = process.threads.len
+		process.threads << t
 	}
 
-	t.tid = process.threads.len
-	process.threads << t
+	if autoenqueue == true && !enqueue_thread(t, false) {
+		if register_with_process {
+			process.threads.delete(process.threads.len - 1)
+		}
+		discard_unstarted_thread(t)
+		errno.set(errno.eagain)
+		return none
+	}
 
 	return t
+}
+
+pub fn discard_unstarted_thread(_thread &proc.Thread) {
+	mut t := unsafe { _thread }
+	if t.is_in_queue || t.running_on != u64(-1) {
+		panic('Attempted to discard a runnable thread')
+	}
+
+	for stack_phys in t.stacks {
+		memory.pmm_free(stack_phys, stack_size / page_size)
+	}
+	if t.fpu_storage != unsafe { nil } {
+		memory.pmm_free(voidptr(u64(t.fpu_storage) - higher_half),
+			lib.div_roundup(fpu_storage_size, page_size))
+	}
+	unsafe {
+		t.stacks.free()
+		t.signalfds.free()
+		free(t)
+	}
 }
 
 pub fn new_process(old_process &proc.Process, pagemap &memory.Pagemap) ?&proc.Process {

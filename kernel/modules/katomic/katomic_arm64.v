@@ -4,6 +4,20 @@ module katomic
 // This file provides the same API as katomic_amd64.v but for ARM64.
 // The build system selects between this and the x86 version.
 
+// The ARM64 build excludes the architecture-neutral katomic.v file, so keep
+// the pointer-slot helpers here as part of the architecture's complete atomic
+// API. Casting the slot to u64 prevents V from dereferencing a nil pointer
+// while instantiating a generic pointer atomic.
+pub fn cas_ptr[T](slot &&T, expected &T, desired &T) bool {
+	mut raw_slot := unsafe { &u64(slot) }
+	return cas[u64](mut raw_slot, u64(expected), u64(desired))
+}
+
+pub fn store_ptr[T](slot &&T, value &T) {
+	mut raw_slot := unsafe { &u64(slot) }
+	store[u64](mut raw_slot, u64(value))
+}
+
 pub fn bts[T](mut var T, bit u8) bool {
 	mask := unsafe { T(1) << bit }
 	mut old := unsafe { T(0) }

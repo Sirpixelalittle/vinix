@@ -5,7 +5,6 @@ import proc
 import sched
 import event.eventstruct
 import x86.cpu
-import x86.cpu.local as cpulocal
 import katomic
 import klock
 
@@ -248,27 +247,23 @@ pub fn pthread_exit(ret voidptr) {
 		cli
 	}
 
-	mut cpu_local := cpulocal.current()
-
 	mut current_thread := proc.current_thread()
 
-	sched.dequeue_thread(current_thread)
-
-	cpu.set_gs_base(u64(&cpu_local.cpu_number))
-	cpu.set_kernel_gs_base(u64(current_thread))
-
 	current_thread.exit_value = ret
+	katomic.store(mut &current_thread.terminated, true)
 	trigger(mut current_thread.exited, false)
 
-	sched.yield(false)
+	sched.dequeue_and_die()
 }
 
 pub fn pthread_wait(t &proc.Thread) voidptr {
 	mut events := [&t.exited]
 	await(mut events, true) or {}
+	for !katomic.load(&t.runtime_reclaimed) {
+		sched.yield(true)
+	}
 	exit_value := t.exit_value
 	unsafe {
-		free(t)
 		events.free()
 	}
 	return exit_value

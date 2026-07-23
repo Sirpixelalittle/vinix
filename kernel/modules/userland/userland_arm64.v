@@ -347,7 +347,14 @@ pub fn sendsig(_thread &proc.Thread, signal u8) {
 
 pub fn syscall_kill(_ voidptr, pid int, signal int) (u64, u64) {
 	if signal > 0 {
-		sendsig(processes[pid].threads[0], u8(signal))
+		if pid <= 0 || pid >= 65536 || processes[pid] == unsafe { nil } {
+			return errno.err, errno.esrch
+		}
+		thrd := proc.first_thread(processes[pid])
+		if thrd == unsafe { nil } {
+			return errno.err, errno.esrch
+		}
+		sendsig(thrd, u8(signal))
 	} else {
 		panic('sendsig: Values of signal <= 0 not supported')
 	}
@@ -439,10 +446,18 @@ pub fn syscall_exit(_ voidptr, status int) {
 	mut current_thread := proc.current_thread()
 	mut current_process := current_thread.process
 
+	if !katomic.cas[bool](mut &current_process.exiting, false, true) {
+		katomic.store(mut &current_thread.terminating, true)
+		terminate_current_thread()
+	}
+
+	stop_process_siblings(current_process, current_thread)
+
 	mut old_pagemap := current_process.pagemap
 
 	kernel_pagemap.switch_to()
 	current_thread.process = kernel_process
+	sched.detach_thread_address_space(current_thread)
 
 	// Close all FDs
 	for i := 0; i < proc.max_fds; i++ {
@@ -509,10 +524,9 @@ pub fn syscall_fork(gpr_state &cpulocal.GPRState) (u64, u64) {
 		sigactions:     old_thread.sigactions
 		masked_signals: old_thread.masked_signals
 		stacks:         stacks
-		fpu_storage:    unsafe { malloc(fpu_storage_size) }
+		fpu_storage:    voidptr(u64(memory.pmm_alloc(lib.div_roundup(fpu_storage_size,
+			page_size))) + higher_half)
 	}
-
-	unsafe { stacks.free() }
 
 	new_thread.self = voidptr(new_thread)
 
@@ -523,7 +537,10 @@ pub fn syscall_fork(gpr_state &cpulocal.GPRState) (u64, u64) {
 	new_thread.gpr_state.x1 = u64(0)
 
 	old_process.children << new_process
+	new_process.threads_lock.acquire()
+	new_thread.tid = new_process.threads.len
 	new_process.threads << new_thread
+	new_process.threads_lock.release()
 
 	sched.enqueue_thread(new_thread, false)
 
@@ -535,6 +552,12 @@ pub fn start_program(execve bool, dir &fs.VFSNode, path string, argv []string, e
 	mut prog := prog_node.resource
 
 	mut new_pagemap := memory.new_pagemap()
+	mut pagemap_transferred := false
+	defer {
+		if !pagemap_transferred {
+			mmap.delete_pagemap(mut new_pagemap) or {}
+		}
+	}
 
 	// Check for shebang before proceeding as if it was an ELF.
 	mut shebang := [2]char{}
@@ -576,6 +599,7 @@ pub fn start_program(execve bool, dir &fs.VFSNode, path string, argv []string, e
 
 	if execve == false {
 		mut new_process := sched.new_process(unsafe { nil }, new_pagemap)?
+		pagemap_transferred = true
 
 		new_process.name = '${path}[${new_process.pid}]'
 
@@ -598,46 +622,68 @@ pub fn start_program(execve bool, dir &fs.VFSNode, path string, argv []string, e
 		new_process.fds[2] = voidptr(stderr_fd)
 
 		sched.new_user_thread(new_process, true, entry_point, unsafe { nil }, 0, argv,
-			envp, auxval, true)?
+			envp, auxval, true, true)?
 
 		return new_process
 	} else {
 		mut t := proc.current_thread()
 		mut curr_process := t.process
+		old_mask := t.masked_signals
+		old_pending := t.pending_signals
+		old_sigactions := t.sigactions
 
-		// Close O_CLOEXEC file descriptors before exec.
-		// This is critical for pipe EOF detection: popen creates pipes
-		// with O_CLOEXEC, and leaked FDs prevent pipe refcount from
-		// reaching 1, blocking EOF on reads.
+		mut staged_process := proc.Process{
+			pagemap:                  new_pagemap
+			thread_stack_top:         u64(0x70000000000)
+			mmap_anon_non_fixed_base: u64(0x80000000000)
+		}
+		mut new_thread := sched.new_user_thread(&staged_process, true, entry_point,
+			unsafe { nil }, 0, argv, envp, auxval, false, false)?
+		mut replacement_owned := true
+		defer {
+			if replacement_owned {
+				sched.discard_unstarted_thread(new_thread)
+			}
+		}
+
+		new_thread.masked_signals = old_mask
+		new_thread.pending_signals = old_pending
+		for i := 0; i < old_sigactions.len; i++ {
+			if old_sigactions[i].sa_sigaction == sig_ign {
+				new_thread.sigactions[i] = old_sigactions[i]
+			}
+		}
+
+		begin_exec_and_stop_siblings(curr_process, t)?
+
 		for i := 0; i < proc.max_fds; i++ {
 			fd_ptr := unsafe { &file.FD(curr_process.fds[i]) }
-			if fd_ptr == unsafe { nil } {
-				continue
-			}
-			if fd_ptr.flags & resource.o_cloexec != 0 {
+			if fd_ptr != unsafe { nil } && fd_ptr.flags & resource.o_cloexec != 0 {
 				file.fdnum_close(curr_process, i, true) or {}
 			}
 		}
 
 		mut old_pagemap := curr_process.pagemap
-
-		curr_process.pagemap = new_pagemap
-
-		curr_process.name = '${path}[${curr_process.pid}]'
-
 		kernel_pagemap.switch_to()
 		t.process = kernel_process
+		sched.detach_thread_address_space(t)
 
-		mmap.delete_pagemap(mut old_pagemap)?
+		curr_process.pagemap = new_pagemap
+		pagemap_transferred = true
+		curr_process.name = '${path}[${curr_process.pid}]'
+		curr_process.thread_stack_top = staged_process.thread_stack_top
+		curr_process.mmap_anon_non_fixed_base = staged_process.mmap_anon_non_fixed_base
+		new_thread.process = curr_process
 
-		curr_process.thread_stack_top = u64(0x70000000000)
-		curr_process.mmap_anon_non_fixed_base = u64(0x80000000000)
+		mmap.delete_pagemap(mut old_pagemap) or {
+			panic('exec: could not reclaim the old address space')
+		}
 
-		// TODO: Kill old threads
-		curr_process.threads = []&proc.Thread{}
-
-		sched.new_user_thread(curr_process, true, entry_point, unsafe { nil }, 0, argv, envp,
-			auxval, true)?
+		replacement_owned = false
+		finish_exec(curr_process, new_thread)
+		if !sched.enqueue_thread(new_thread, false) {
+			panic('exec: could not enqueue the replacement thread')
+		}
 
 		unsafe {
 			argv.free()

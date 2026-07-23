@@ -222,23 +222,21 @@ pub fn pthread_exit(ret voidptr) {
 
 	mut current_thread := proc.current_thread()
 
-	sched.dequeue_thread(current_thread)
-
-	// On ARM64, per-CPU thread tracking is via TPIDR_EL1 + array
-	// (already managed by proc.set_current_thread)
-
 	current_thread.exit_value = ret
+	katomic.store(mut &current_thread.terminated, true)
 	trigger(mut current_thread.exited, false)
 
-	sched.yield(false)
+	sched.dequeue_and_die()
 }
 
 pub fn pthread_wait(t &proc.Thread) voidptr {
 	mut events := [&t.exited]
 	await(mut events, true) or {}
+	for !katomic.load(&t.runtime_reclaimed) {
+		sched.yield(true)
+	}
 	exit_value := t.exit_value
 	unsafe {
-		free(t)
 		events.free()
 	}
 	return exit_value

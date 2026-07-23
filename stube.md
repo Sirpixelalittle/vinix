@@ -59,28 +59,54 @@ Completion criteria:
 
 ### `execve()` sibling-thread teardown
 
-- [ ] Prevent new sibling threads from appearing once `execve()` commits.
-- [ ] Stop and dequeue every sibling thread.
-- [ ] Wait until sibling threads can no longer execute in the old address
+- [x] Prevent new sibling threads from appearing once `execve()` commits.
+- [x] Stop and dequeue every sibling thread.
+- [x] Wait until sibling threads can no longer execute in the old address
   space.
-- [ ] Preserve rollback behavior while the new image is still being prepared.
-- [ ] Free the old page map only after all old threads are gone.
-- [ ] Cover both x86-64 and ARM64 through shared lifecycle logic where
+- [x] Preserve rollback behavior while the new image is still being prepared.
+- [x] Free the old page map only after all old threads are gone.
+- [x] Cover both x86-64 and ARM64 through shared lifecycle logic where
   possible.
-- [ ] Add a multithreaded `execve()` stress test.
+- [x] Add a multithreaded `execve()` stress test.
 
 Evidence:
 
-- [x86-64 `execve()`](kernel/modules/userland/userland.v#L1062) clears the
-  process thread list without killing the old threads.
-- [ARM64 `execve()`](kernel/modules/userland/userland_arm64.v#L636) has the
-  same TODO and behavior.
+- [`kernel/modules/userland/lifecycle.v`](kernel/modules/userland/lifecycle.v)
+  provides the shared exec/exit stop barrier. Thread creation and exec commit
+  serialize on `Process.threads_lock`, and each sibling acknowledges
+  termination only after switching to the kernel page map.
+- Both architecture-specific exec paths fully construct the candidate image
+  and replacement thread before entering the irreversible barrier. The old
+  page map is reclaimed only after all sibling acknowledgements.
+- The scheduler defers kernel-stack and FPU-state reclamation until a later
+  context-switch epoch, then releases them from a dedicated reaper thread so
+  no CPU can still be using a retired stack and timer interrupts stay bounded.
+- [`tests/execve-sibling-stress/main.c`](tests/execve-sibling-stress/main.c)
+  races exec against userspace and syscall spinners, an event-blocked thread,
+  and concurrent thread creation. It also verifies that a failed exec leaves
+  the multithreaded process usable. The final implementation passed a
+  128-round run plus the 16-round rollback probe on a 4-vCPU, 2 GiB QEMU
+  guest.
 
 Completion criteria:
 
 - A successful `execve()` leaves exactly the calling thread in the process.
 - No old thread can run after the old page map is destroyed.
 - Failed image construction leaves the original process intact.
+
+### Thread descriptor reference management
+
+- [ ] Replace long-lived borrowed `Thread` pointers in console and timer state
+  with reference-counted handles or process-level identifiers.
+- [ ] Reclaim retired `Thread` descriptors after the last external reference
+  is released.
+
+Evidence:
+
+- The scheduler reaper releases each retired thread's physical kernel stacks
+  and FPU storage, which account for nearly all of its memory, but retains the
+  small non-runnable descriptor as a tombstone. Freeing that descriptor today
+  would leave dangling pointers in legacy console, timer, and signal paths.
 
 ### ARM64 false-success syscall compatibility
 

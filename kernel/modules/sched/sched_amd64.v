@@ -23,6 +23,8 @@ pub fn initialise() {
 	kernel_process = &proc.Process{
 		pagemap: &kernel_pagemap
 	}
+	retired_thread_reaper = new_kernel_thread(voidptr(retired_thread_reaper_main),
+		unsafe { nil }, true)
 }
 
 fn get_next_thread() &proc.Thread {
@@ -71,6 +73,7 @@ fn scheduler_isr(_ u32, gpr_state &cpulocal.GPRState) {
 	mut cpu_local := cpulocal.current()
 
 	katomic.store(mut &cpu_local.is_idle, false)
+	mark_retired_threads_quiescent(cpu_local.cpu_number, cpu_local.switch_count)
 
 	mut current_thread := proc.current_thread()
 
@@ -108,6 +111,7 @@ fn scheduler_isr(_ u32, gpr_state &cpulocal.GPRState) {
 	}
 
 	current_thread = next_thread
+	cpu_local.switch_count++
 
 	cpu.set_gs_base(u64(current_thread))
 	// While the kernel is running, GS identifies the current thread and
@@ -205,6 +209,9 @@ fn scheduler_isr(_ u32, gpr_state &cpulocal.GPRState) {
 pub fn enqueue_thread(_thread &proc.Thread, by_signal bool) bool {
 	mut t := unsafe { _thread }
 
+	if katomic.load(&t.terminated) {
+		return false
+	}
 	if t.is_in_queue == true {
 		return true
 	}
@@ -247,6 +254,11 @@ pub fn dequeue_thread(_thread &proc.Thread) bool {
 	}
 
 	return false
+}
+
+pub fn detach_thread_address_space(_thread &proc.Thread) {
+	mut t := unsafe { _thread }
+	t.cr3 = u64(kernel_process.pagemap.top_level)
 }
 
 // Like dequeue_thread(), but it stops it immediately
@@ -322,8 +334,8 @@ pub fn dequeue_and_die() {
 	}
 	mut t := proc.current_thread()
 	dequeue_thread(t)
-	unsafe {
-	}
+	mut cpu_local := cpulocal.current()
+	retire_current_thread(t, cpu_local.cpu_number, cpu_local.switch_count)
 	yield(false)
 	for {}
 }
@@ -358,8 +370,6 @@ pub fn new_kernel_thread(pc voidptr, arg voidptr, autoenqueue bool) &proc.Thread
 			higher_half)
 	}
 
-	unsafe { stacks.free() }
-
 	t.self = voidptr(t)
 	t.gs_base = u64(voidptr(t))
 
@@ -384,20 +394,44 @@ pub fn syscall_new_thread(_ voidptr, pc voidptr, stack u64) (u64, u64) {
 		unsafe { empty_string_array.free() }
 	}
 
-	mut new_thread := new_user_thread(process, false, pc, unsafe { nil }, stack, empty_string_array,
-		empty_string_array, unsafe { nil }, false) or { return errno.err, errno.get() }
+	mut new_thread := new_user_thread(process, false, pc, unsafe { nil }, stack,
+		empty_string_array, empty_string_array, unsafe { nil }, false, true) or {
+		return errno.err, errno.get()
+	}
 
 	enqueue_thread(new_thread, false)
 
 	return u64(new_thread.tid + 1), 0
 }
 
-pub fn new_user_thread(_process &proc.Process, want_elf bool, pc voidptr, arg voidptr, _stack u64, argv []string, envp []string, auxval &elf.Auxval, autoenqueue bool) ?&proc.Thread {
+pub fn new_user_thread(_process &proc.Process, want_elf bool, pc voidptr, arg voidptr,
+	_stack u64, argv []string, envp []string, auxval &elf.Auxval, autoenqueue bool,
+	register_with_process bool) ?&proc.Thread {
 	mut process := unsafe { _process }
 
-	mut stacks := []voidptr{}
+	if autoenqueue && !register_with_process {
+		panic('Cannot enqueue an unregistered user thread')
+	}
+	if register_with_process {
+		process.threads_lock.acquire()
+		if process.execing || katomic.load(&process.exiting) {
+			process.threads_lock.release()
+			errno.set(errno.eagain)
+			return none
+		}
+	}
 	defer {
-		unsafe { stacks.free() }
+		if register_with_process {
+			process.threads_lock.release()
+		}
+	}
+
+	mut stacks := []voidptr{}
+	mut stacks_transferred := false
+	defer {
+		if !stacks_transferred {
+			unsafe { stacks.free() }
+		}
 	}
 
 	mut stack := unsafe { &u64(0) }
@@ -450,6 +484,7 @@ pub fn new_user_thread(_process &proc.Process, want_elf bool, pc voidptr, arg vo
 		fpu_storage:  voidptr(u64(memory.pmm_alloc(lib.div_roundup(fpu_storage_size, page_size))) +
 			higher_half)
 	}
+	stacks_transferred = true
 
 	t.self = voidptr(t)
 	t.gs_base = u64(0)
@@ -547,14 +582,44 @@ pub fn new_user_thread(_process &proc.Process, want_elf bool, pc voidptr, arg vo
 		}
 	}
 
-	if autoenqueue == true {
-		enqueue_thread(t, false)
+	if register_with_process {
+		t.tid = process.threads.len
+		process.threads << t
 	}
 
-	t.tid = process.threads.len
-	process.threads << t
+	if autoenqueue == true && !enqueue_thread(t, false) {
+		if register_with_process {
+			process.threads.delete(process.threads.len - 1)
+		}
+		discard_unstarted_thread(t)
+		errno.set(errno.eagain)
+		return none
+	}
 
 	return t
+}
+
+// Release a fully prepared thread that has never been published or run. Its
+// userspace stack belongs to the candidate pagemap and is reclaimed when that
+// pagemap is deleted.
+pub fn discard_unstarted_thread(_thread &proc.Thread) {
+	mut t := unsafe { _thread }
+	if t.is_in_queue || t.running_on != u64(-1) {
+		panic('Attempted to discard a runnable thread')
+	}
+
+	for stack_phys in t.stacks {
+		memory.pmm_free(stack_phys, stack_size / page_size)
+	}
+	if t.fpu_storage != unsafe { nil } {
+		memory.pmm_free(voidptr(u64(t.fpu_storage) - higher_half),
+			lib.div_roundup(fpu_storage_size, page_size))
+	}
+	unsafe {
+		t.stacks.free()
+		t.signalfds.free()
+		free(t)
+	}
 }
 
 pub fn new_process(old_process &proc.Process, pagemap &memory.Pagemap) ?&proc.Process {
