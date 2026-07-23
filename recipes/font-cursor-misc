@@ -1,0 +1,33 @@
+#! /bin/sh
+
+name=font-cursor-misc
+version=1.0.4
+revision=1
+tarball_url="https://www.x.org/releases/individual/font/font-cursor-misc-${version}.tar.xz"
+tarball_blake2b="080d34385b352241de6312554d8896926a761db24a58d3b5946e78f03c55fa246ca1a9750ce057b0f0a5d7edd3778951c05932615eb42be30458fa9e2422205f"
+hostdeps="gcc pkg-config bdftopcf mkfontscale"
+builddeps="xorg-font-util xorg-util-macros"
+
+prepare() {
+    autotools_recursive_regen
+}
+
+configure() {
+    autotools_configure \
+        --with-fontrootdir=/usr/share/fonts/X11 \
+        --with-fontdir=/usr/share/fonts/X11/misc \
+        --with-compression=no
+}
+
+build() {
+    make -j${parallelism}
+}
+
+package() {
+    DESTDIR="${dest_dir}" make install
+
+    # The complete X font bundle owns the combined directory index. Keeping
+    # per-package indices would make font packages conflict and whichever one
+    # was installed last would hide the other package's fonts.
+    rm -f "${dest_dir}${prefix}"/share/fonts/X11/misc/fonts.dir
+}

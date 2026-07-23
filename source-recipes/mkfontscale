@@ -1,0 +1,6 @@
+#! /bin/sh
+
+name=mkfontscale
+version=1.2.4
+tarball_url="https://www.x.org/releases/individual/app/mkfontscale-${version}.tar.xz"
+tarball_blake2b="4df26037e6a855f61a4bd47bfdf3c455c5178f401218b6655b6771de6615ca91265b0204a04d1798f463fc1b66df122e0ca273088f9f9522ed87757cba6b3f59"

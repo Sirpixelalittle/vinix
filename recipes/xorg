@@ -6,4 +6,4 @@ name=xorg
 skip_pkg_check=yes
 version=0.0
 revision=1
-deps="xorg-server xorg-xinit xf86-video-fbdev xf86-input-keyboard xf86-input-mouse"
+deps="xorg-server xorg-xinit xorg-fonts xf86-video-fbdev xf86-input-keyboard xf86-input-mouse"

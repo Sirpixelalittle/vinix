@@ -1,0 +1,26 @@
+#! /bin/sh
+
+name=mkfontscale
+from_source=mkfontscale
+revision=1
+imagedeps="build-essential pkgconf libfontenc-dev libfreetype-dev zlib1g-dev x11proto-dev"
+
+configure() {
+        CFLAGS="$HOST_CFLAGS" \
+        LDFLAGS="$HOST_LDFLAGS -static" \
+        PKG_CONFIG="/usr/bin/pkg-config --static" \
+    "${source_dir}"/configure \
+        --prefix="${prefix}" \
+        --without-bzip2
+}
+
+build() {
+    make -j${parallelism}
+}
+
+package() {
+    DESTDIR="${dest_dir}" make install
+
+        strip_command=strip \
+    post_package_strip
+}

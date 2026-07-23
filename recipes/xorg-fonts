@@ -1,0 +1,23 @@
+#! /bin/sh
+
+# Core X bitmap-font bundle. The source packages intentionally do not ship
+# competing fonts.dir files; this package creates one index over the complete
+# directory and is its sole owner.
+name=xorg-fonts
+version=1.0
+revision=1
+hostdeps="mkfontscale"
+deps="font-alias font-cursor-misc font-misc-misc"
+
+build() {
+    rm -rf misc-font-index
+    mkdir -p misc-font-index
+    cp "${sysroot_dir}"/usr/share/fonts/X11/misc/*.pcf misc-font-index/
+    mkfontdir misc-font-index
+}
+
+package() {
+    mkdir -p "${dest_dir}${prefix}"/share/fonts/X11/misc
+    install -m 0644 misc-font-index/fonts.dir \
+        "${dest_dir}${prefix}"/share/fonts/X11/misc/fonts.dir
+}

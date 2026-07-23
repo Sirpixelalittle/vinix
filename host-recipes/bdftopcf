@@ -1,0 +1,25 @@
+#! /bin/sh
+
+name=bdftopcf
+from_source=bdftopcf
+revision=1
+imagedeps="build-essential pkgconf x11proto-dev"
+
+configure() {
+        CFLAGS="$HOST_CFLAGS" \
+        LDFLAGS="$HOST_LDFLAGS" \
+        PKG_CONFIG=/usr/bin/pkg-config \
+    "${source_dir}"/configure \
+        --prefix="${prefix}"
+}
+
+build() {
+    make -j${parallelism}
+}
+
+package() {
+    DESTDIR="${dest_dir}" make install
+
+        strip_command=strip \
+    post_package_strip
+}

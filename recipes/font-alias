@@ -1,0 +1,26 @@
+#! /bin/sh
+
+name=font-alias
+version=1.0.6
+revision=1
+tarball_url="https://www.x.org/releases/individual/font/font-alias-${version}.tar.xz"
+tarball_blake2b="73c7d65a8c21da2bfab71cfe8f1a835e1a6550dd87564ecef8e7c064f78fe142e2b572080c7e9d297a481f8f628ff82c71709a11a77ccb4c2b712fd50a3ba2e6"
+hostdeps="gcc pkg-config"
+builddeps="xorg-font-util xorg-util-macros"
+
+prepare() {
+    autotools_recursive_regen
+}
+
+configure() {
+    autotools_configure \
+        --with-fontrootdir=/usr/share/fonts/X11
+}
+
+build() {
+    make -j${parallelism}
+}
+
+package() {
+    DESTDIR="${dest_dir}" make install
+}
