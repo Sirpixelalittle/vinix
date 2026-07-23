@@ -341,6 +341,29 @@ diff -urN --no-dereference v-clean/vlib/builtin/backtraces_nix.c.v v-workdir/vli
  		} $else {
  			println('print_backtrace_skipping_top_frames is not implemented. skipframes: ${skipframes}')
  		}
+diff -urN --no-dereference v-clean/vlib/builtin/character_inout.c.v v-workdir/vlib/builtin/character_inout.c.v
+--- v-clean/vlib/builtin/character_inout.c.v
++++ v-workdir/vlib/builtin/character_inout.c.v
+@@ -7,9 +7,6 @@
+ 	$if freestanding {
+ 		// TODO
+ 		return -1
+-	} $else $if vinix {
+-		// TODO
+-		return -1
+ 	} $else {
+ 		ch = C.getchar()
+ 		if ch == C.EOF {
+@@ -30,9 +27,6 @@
+ 		C.android_print(C.stdout, c'%.*s', 1, voidptr(&ch))
+ 	} $else $if freestanding {
+ 		bare_print(voidptr(&ch), u64(1))
+-	} $else $if vinix {
+-		// TODO
+-		return 0
+ 	} $else {
+ 		x := C.putchar(ch)
+ 		if x == C.EOF {
 diff -urN --no-dereference v-clean/vlib/net/address_vinix.c.v v-workdir/vlib/net/address_vinix.c.v
 --- v-clean/vlib/net/address_vinix.c.v	1969-12-31 18:00:00.000000000 -0600
 +++ v-workdir/vlib/net/address_vinix.c.v
@@ -407,6 +430,27 @@ diff -urN --no-dereference v-clean/vlib/net/address_vinix.c.v v-workdir/vlib/net
 +	f    u16
 +	addr AddrData
 +}
+diff -urN --no-dereference v-clean/vlib/readline/readline_nix.c.v v-workdir/vlib/readline/readline_nix.c.v
+--- v-clean/vlib/readline/readline_nix.c.v
++++ v-workdir/vlib/readline/readline_nix.c.v
+@@ -120,6 +120,9 @@
+ 	if !r.is_raw {
+ 		r.enable_raw_mode()
+ 	}
++	defer {
++		r.disable_raw_mode()
++	}
+ 	print(r.prompt)
+ 	for {
+ 		flush_stdout()
+@@ -131,7 +134,6 @@
+ 	}
+ 	r.previous_lines[0] = []rune{}
+ 	r.search_index = 0
+-	r.disable_raw_mode()
+ 	if r.current.len == 0 {
+ 		return error('empty line')
+ 	} else {
 diff -urN --no-dereference v-clean/vlib/term/term_nix.c.v v-workdir/vlib/term/term_nix.c.v
 --- v-clean/vlib/term/term_nix.c.v
 +++ v-workdir/vlib/term/term_nix.c.v
