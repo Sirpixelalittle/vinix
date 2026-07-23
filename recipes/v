@@ -8,12 +8,18 @@ git_url="https://github.com/vlang/v.git"
 commit=dd859eae55cf4e69346851fe285b9af104c8ffb7
 source_allow_network="yes"
 source_imagedeps="git"
-hostdeps="gcc"
-deps="core-libs"
+imagedeps="build-essential"
+hostdeps="gcc v"
+deps="core-libs libx11"
 
 prepare() {
     git clone https://github.com/vlang/vc.git \
         --revision=216b1cdc8b1acad5b03e9cf8767f44f2742bf8f5 \
+        --depth=1
+
+    mkdir -p .vmodules
+    git clone https://github.com/vlang/markdown.git .vmodules/markdown \
+        --revision=5a1c9d82669e765493abe19488eaef0252c97dac \
         --depth=1
 
     cd vc
@@ -25,7 +31,26 @@ build() {
     cp -rpf ${source_dir}/. ./
 
     set -x
-    ${OS_TRIPLET}-gcc $TARGET_CFLAGS $TARGET_CPPFLAGS -w -std=gnu99 $TARGET_LDFLAGS vc/v.c -o v
+    # V normally compiles commands such as vrepl and vfmt on first use. The
+    # installed source tree is read-only, so follow V's distribution packaging
+    # model and cross-compile those tools while building the package instead.
+    cp "$(command -v v)" v-host
+    VEXE="$PWD/v-host" VCROSS_COMPILER_NAME=${OS_TRIPLET}-gcc \
+        ./v-host -prod -gc none -os vinix -o v cmd/v
+    VEXE="$PWD/v-host" ./v-host -prod -o vbuild-tools-host \
+        cmd/tools/vbuild-tools.v
+    VEXE="$PWD/v-host" VMODULES="$PWD/.vmodules" \
+        VTEST_SANDBOXED_PACKAGING=1 \
+        VCROSS_COMPILER_NAME=${OS_TRIPLET}-gcc \
+        ./vbuild-tools-host -prod -gc none -os vinix build-tools
+    # Some tools invoke the C backend while they are being built and leave
+    # response files beside their sources. They are build intermediates, not
+    # part of the installed compiler tree.
+    find cmd/tools -type f \( -name '*.tmp.c' -o -name '*.tmp.c.rsp' \) \
+        -delete
+    rm -f v-host vbuild-tools-host
+    rm -rf .vmodules
+    touch cmd/tools/.disable_autorecompilation
     set +x
 }
 

@@ -1,0 +1,523 @@
+diff -urN --no-dereference v-clean/cmd/tools/vself.v v-workdir/cmd/tools/vself.v
+--- v-clean/cmd/tools/vself.v
++++ v-workdir/cmd/tools/vself.v
+@@ -1,111 +1,6 @@
+ module main
+ 
+-import os
+-import os.cmdline
+-import v.util.recompilation
+-
+-const args_ = arguments()
+-const is_debug = args_.contains('-debug')
+-
+-// support a renamed `v` executable too:
+-const vexe = os.getenv_opt('VEXE') or { @VEXE }
+-
+-const vroot = os.dir(vexe)
+-
+ fn main() {
+-	// make testing `v up` easier, by providing a way to force `v self` to fail,
+-	// to test the fallback logic:
+-	if os.getenv('VSELF_SHOULD_FAIL') != '' {
+-		eprintln('v self failed')
+-		exit(1)
+-	}
+-	vexe_name := os.file_name(vexe)
+-	short_v_name := vexe_name.all_before('.')
+-
+-	recompilation.must_be_enabled(vroot, 'Please install V from source, to use `${vexe_name} self` .')
+-	os.chdir(vroot)!
+-	os.setenv('VCOLORS', 'always', true)
+-	mut args := args_[1..].filter(it != 'self')
+-	if args.len == 0 || ('-cc' !in args && '-prod' !in args && '-parallel-cc' !in args) {
+-		// compiling by default, i.e. `v self`:
+-		uos := os.user_os()
+-		uname := os.uname()
+-		if uos == 'macos' && uname.machine == 'arm64' {
+-			// Apple silicon, like m1, m2 etc
+-			// Use tcc by default for V, since tinycc is much faster and also
+-			// it already supports compiling many programs like V itself, that do not depend on inlined objective-C code
+-			args << '-cc tcc'
+-		}
+-	}
+-	jargs := args.join(' ')
+-	obinary := cmdline.option(args, '-o', '')
+-	sargs := if obinary != '' { jargs } else { '${jargs} -o v2' }
+-	cmd := '${os.quoted_path(vexe)} ${sargs} ${os.quoted_path('cmd/v')}'
+-	options := if args.len > 0 { '(${sargs})' } else { '' }
+-	println('V self compiling ${options}...')
+-	compile(vroot, cmd)
+-	if obinary != '' {
+-		// When -o was given, there is no need to backup/rename the original.
+-		// The user just wants an independent copy of v, and so we are done.
+-		return
+-	}
+-	backup_old_version_and_rename_newer(short_v_name) or { panic(err.msg()) }
+-	println('V built successfully as executable "${vexe_name}".')
+-}
+-
+-fn compile(vroot string, cmd string) {
+-	result := os.execute_or_exit(cmd)
+-	if result.exit_code != 0 {
+-		eprintln('cannot compile to `${vroot}`: \n${result.output}')
+-		exit(1)
+-	}
+-	if result.output.len > 0 {
+-		println(result.output.trim_space())
+-	}
+-}
+-
+-fn list_folder(short_v_name string, bmessage string, message string) {
+-	if !is_debug {
+-		return
+-	}
+-	if bmessage != '' {
+-		println(bmessage)
+-	}
+-	if os.user_os() == 'windows' {
+-		os.system('dir ${short_v_name}*.exe')
+-	} else {
+-		os.system('ls -lartd ${short_v_name}*')
+-	}
+-	println(message)
+-}
+-
+-fn backup_old_version_and_rename_newer(short_v_name string) !bool {
+-	mut errors := []string{}
+-	short_v_file := if os.user_os() == 'windows' { '${short_v_name}.exe' } else { '${short_v_name}' }
+-	short_v2_file := if os.user_os() == 'windows' { 'v2.exe' } else { 'v2' }
+-	short_bak_file := if os.user_os() == 'windows' { 'v_old.exe' } else { 'v_old' }
+-	v_file := os.real_path(short_v_file)
+-	v2_file := os.real_path(short_v2_file)
+-	bak_file := os.real_path(short_bak_file)
+-
+-	list_folder(short_v_name, 'before:', 'removing ${bak_file} ...')
+-	if os.exists(bak_file) {
+-		os.rm(bak_file) or { errors << 'failed removing ${bak_file}: ${err.msg()}' }
+-	}
+-
+-	list_folder(short_v_name, '', 'moving ${v_file} to ${bak_file} ...')
+-	os.mv(v_file, bak_file) or { errors << err.msg() }
+-
+-	list_folder(short_v_name, '', 'removing ${v_file} ...')
+-	os.rm(v_file) or {}
+-
+-	list_folder(short_v_name, '', 'moving ${v2_file} to ${v_file} ...')
+-	os.mv_by_cp(v2_file, v_file) or { panic(err.msg()) }
+-
+-	list_folder(short_v_name, 'after:', '')
+-
+-	if errors.len > 0 {
+-		eprintln('backup errors:\n  >>  ' + errors.join('\n  >>  '))
+-	}
+-	return true
++	eprintln('v self is disabled for the packaged version of V.')
++	eprintln('Use the Vinix package manager to update V, or install V from source.')
+ }
+diff -urN --no-dereference v-clean/cmd/tools/vup.v v-workdir/cmd/tools/vup.v
+--- v-clean/cmd/tools/vup.v
++++ v-workdir/cmd/tools/vup.v
+@@ -1,207 +1,6 @@
+ module main
+ 
+-import os
+-import v.util.version
+-import v.util.recompilation
+-
+-const vexe = os.real_path(os.getenv_opt('VEXE') or { @VEXE })
+-
+-const vroot = os.dir(vexe)
+-
+-struct App {
+-	is_verbose bool
+-	is_prod    bool
+-	vexe       string
+-	vroot      string
+-
+-	skip_v_self  bool // do not run `v self`, effectively enforcing the running of `make` or `make.bat`
+-	skip_current bool // skip the current hash check, enabling easier testing on the same commit, without using docker etc
+-}
+-
+-const args = arguments()
+-
+-fn new_app() App {
+-	return App{
+-		is_verbose:   '-v' in args
+-		is_prod:      '-prod' in args
+-		vexe:         vexe
+-		vroot:        vroot
+-		skip_v_self:  '-skip_v_self' in args
+-		skip_current: '-skip_current' in args
+-	}
+-}
+-
+ fn main() {
+-	app := new_app()
+-	recompilation.must_be_enabled(app.vroot, 'Please install V from source, to use `v up` .')
+-	os.chdir(app.vroot)!
+-	println('Updating V...')
+-	app.update_from_master()
+-	hash_when_vup_was_compiled := @VCURRENTHASH
+-	current_hash_from_filesystem := version.githash(vroot) or { hash_when_vup_was_compiled }
+-	if !app.skip_current && hash_when_vup_was_compiled == current_hash_from_filesystem {
+-		println('V is already updated.')
+-		app.show_current_v_version()
+-		return
+-	}
+-	if os.user_os() == 'windows' {
+-		app.backup('cmd/tools/vup.exe')
+-	}
+-	if !app.recompile_v() {
+-		app.show_current_v_version()
+-		eprintln('Recompiling V *failed*.')
+-		eprintln('Try running `${get_make_cmd_name()}` .')
+-		exit(1)
+-	}
+-	app.recompile_vup()
+-	app.show_current_v_version()
+-}
+-
+-fn (app App) vprintln(s string) {
+-	if app.is_verbose {
+-		println(s)
+-	}
+-}
+-
+-fn (app App) update_from_master() {
+-	app.vprintln('> updating from master ...')
+-	if !os.exists('.git') {
+-		// initialize the folder, as if it had been cloned:
+-		app.git_command('git init')
+-		app.git_command('git remote add origin https://github.com/vlang/v')
+-		app.git_command('git fetch')
+-		app.git_command('git remote set-head origin master')
+-		app.git_command('git reset --hard origin/master')
+-		// Note 1: patterns starting with /, will match only against the root;
+-		//         `--exclude v` will match also vlib/v/ in addition to ./v; `--exclude /v` will only match ./v
+-		// Note 2: patterns ending with / are treated as folders.
+-		app.git_command('git clean -xfd --exclude /thirdparty/tcc/ --exclude /v --exclude /v.exe --exclude /cmd/tools/vup --exclude /cmd/tools/vup.exe')
+-	} else {
+-		// pull latest
+-		app.git_command('git pull https://github.com/vlang/v master')
+-	}
+-}
+-
+-fn (app App) recompile_v() bool {
+-	// Note: app.vexe is more reliable than just v (which may be a symlink)
+-	opts := if app.is_prod { '-prod' } else { '' }
+-	vself := '${os.quoted_path(app.vexe)} ${opts} self'
+-	if app.skip_v_self {
+-		return app.make(vself)
+-	}
+-
+-	self_result := os.execute(vself)
+-	if self_result.exit_code == 0 {
+-		println(self_result.output.trim_space())
+-		println('> Done recompiling.')
+-		return true
+-	} else {
+-		println('> `${vself}` failed, running `make`...')
+-		app.vprintln(self_result.output.trim_space())
+-	}
+-	return app.make(vself)
+-}
+-
+-fn (app App) recompile_vup() bool {
+-	eprintln('> Recompiling vup.v ...')
+-	vup_result := os.execute('${os.quoted_path(app.vexe)} -g cmd/tools/vup.v')
+-	if vup_result.exit_code != 0 {
+-		eprintln('> Failed recompiling vup.v .')
+-		eprintln(vup_result.output)
+-		return false
+-	}
+-	return true
+-}
+-
+-fn (app App) make(vself string) bool {
+-	println('> running make ...')
+-	make := get_make_cmd_name()
+-	make_result := os.execute(make)
+-	if make_result.exit_code != 0 {
+-		eprintln('> ${make} failed:')
+-		eprintln('> make output:')
+-		eprintln(make_result.output)
+-		return false
+-	}
+-	app.vprintln(make_result.output)
+-	println('> done running make.')
+-	return true
+-}
+-
+-fn (app App) show_current_v_version() {
+-	vout := os.execute('${os.quoted_path(app.vexe)} version')
+-	if vout.exit_code >= 0 {
+-		mut vversion := vout.output.trim_space()
+-		if vout.exit_code == 0 {
+-			latest_v_commit := vversion.split(' ').last().all_after('.')
+-			latest_v_commit_time := os.execute('git show -s --format=%ci ${latest_v_commit}')
+-			if latest_v_commit_time.exit_code == 0 {
+-				vversion += ', timestamp: ' + latest_v_commit_time.output.trim_space()
+-			}
+-		}
+-		println('Current V version: ${vversion}')
+-	}
+-}
+-
+-fn (app App) backup(file string) {
+-	backup_file := '${file}_old.exe'
+-	println('> backing up `${file}` to `${backup_file}` ...')
+-	if os.exists(backup_file) {
+-		os.rm(backup_file) or { eprintln('failed removing ${backup_file}: ${err.msg()}') }
+-	}
+-	os.mv(file, backup_file) or { eprintln('failed moving ${file}: ${err.msg()}') }
+-}
+-
+-fn (app App) git_command(command string) {
+-	println('> git_command: ${command}')
+-	git_result := os.execute(command)
+-	if git_result.exit_code < 0 {
+-		app.install_git()
+-		// Try it again with (maybe) git installed
+-		os.execute_or_exit(command)
+-	}
+-	if git_result.exit_code != 0 {
+-		eprintln('Failed git command: ${command}')
+-		eprintln(git_result.output)
+-		exit(1)
+-	}
+-	app.vprintln(git_result.output)
+-}
+-
+-fn (app App) install_git() {
+-	if os.user_os() != 'windows' {
+-		// Probably some kind of *nix, usually need to get using a package manager.
+-		eprintln("error: Install `git` using your system's package manager")
+-	}
+-	println('Downloading git 32 bit for Windows, please wait.')
+-	// We'll use 32 bit because maybe someone out there is using 32-bit windows
+-	res_download := os.execute('bitsadmin.exe /transfer "vgit" https://github.com/git-for-windows/git/releases/download/v2.30.0.windows.2/Git-2.30.0.2-32-bit.exe "${os.getwd()}/git32.exe"')
+-	if res_download.exit_code != 0 {
+-		eprintln('Unable to install git automatically: please install git manually')
+-		panic(res_download.output)
+-	}
+-	res_git32 := os.execute(os.quoted_path(os.join_path_single(os.getwd(), 'git32.exe')))
+-	if res_git32.exit_code != 0 {
+-		eprintln('Unable to install git automatically: please install git manually')
+-		panic(res_git32.output)
+-	}
+-}
+-
+-fn get_make_cmd_name() string {
+-	if os.user_os() == 'windows' {
+-		return 'make.bat'
+-	}
+-	cmd := 'make'
+-	make_sure_cmd_is_available(cmd)
+-	cc := os.getenv_opt('CC') or { 'cc' }
+-	make_sure_cmd_is_available(cc)
+-	return cmd
+-}
+-
+-fn make_sure_cmd_is_available(cmd string) {
+-	found_path := os.find_abs_path_of_executable(cmd) or {
+-		eprintln('Could not find `${cmd}` in PATH. Please install `${cmd}`, since `v up` needs it.')
+-		exit(1)
+-	}
+-	println('Found `${cmd}` as `${found_path}`.')
++	eprintln('v up is disabled for the packaged version of V.')
++	eprintln('Use the Vinix package manager to update V, or install V from source.')
+ }
+diff -urN --no-dereference v-clean/vlib/builtin/backtraces_nix.c.v v-workdir/vlib/builtin/backtraces_nix.c.v
+--- v-clean/vlib/builtin/backtraces_nix.c.v
++++ v-workdir/vlib/builtin/backtraces_nix.c.v
+@@ -10,6 +10,9 @@
+ 			return print_backtrace_skipping_top_frames_bsd(skipframes)
+ 		} $else $if linux {
+ 			return print_backtrace_skipping_top_frames_linux(skipframes)
++		} $else $if vinix {
++			// Vinix does not provide a userspace stack-unwinding API yet.
++			return false
+ 		} $else {
+ 			println('print_backtrace_skipping_top_frames is not implemented. skipframes: ${skipframes}')
+ 		}
+diff -urN --no-dereference v-clean/vlib/net/address_vinix.c.v v-workdir/vlib/net/address_vinix.c.v
+--- v-clean/vlib/net/address_vinix.c.v	1969-12-31 18:00:00.000000000 -0600
++++ v-workdir/vlib/net/address_vinix.c.v
+@@ -0,0 +1,62 @@
++module net
++
++// Vinix uses mlibc's Linux-compatible socket address ABI.
++const max_unix_path = 108
++
++pub struct C.addrinfo {
++mut:
++	ai_family    int
++	ai_socktype  int
++	ai_flags     int
++	ai_protocol  int
++	ai_addrlen   int
++	ai_addr      voidptr
++	ai_canonname voidptr
++	ai_next      voidptr
++}
++
++pub struct C.sockaddr_in {
++mut:
++	sin_family u16
++	sin_port   u16
++	sin_addr   u32
++}
++
++pub struct C.sockaddr_in6 {
++mut:
++	sin6_family u16
++	sin6_port   u16
++	sin6_addr   [4]u32
++}
++
++pub struct C.sockaddr_un {
++mut:
++	sun_family u16
++	sun_path   [max_unix_path]char
++}
++
++@[_pack: '1']
++pub struct Ip6 {
++	port      u16
++	flow_info u32
++	addr      [16]u8
++	scope_id  u32
++}
++
++@[_pack: '1']
++pub struct Ip {
++	port    u16
++	addr    [4]u8
++	sin_pad [8]u8
++}
++
++pub struct Unix {
++	path [max_unix_path]u8
++}
++
++@[_pack: '1']
++pub struct Addr {
++pub:
++	f    u16
++	addr AddrData
++}
+diff -urN --no-dereference v-clean/vlib/term/term_nix.c.v v-workdir/vlib/term/term_nix.c.v
+--- v-clean/vlib/term/term_nix.c.v
++++ v-workdir/vlib/term/term_nix.c.v
+@@ -5,6 +5,7 @@
+ import time
+ 
+ #include <sys/ioctl.h>
++#include <termios.h>
+ 
+ pub struct C.winsize {
+ pub:
+diff -urN --no-dereference v-clean/vlib/term/termios/termios_vinix.c.v v-workdir/vlib/term/termios/termios_vinix.c.v
+--- v-clean/vlib/term/termios/termios_vinix.c.v	1969-12-31 18:00:00.000000000 -0600
++++ v-workdir/vlib/term/termios/termios_vinix.c.v
+@@ -0,0 +1,87 @@
++// Copyright (c) 2019-2024 Alexander Medvednikov. All rights reserved.
++// Use of this source code is governed by an MIT license
++// that can be found in the LICENSE file.
++//
++// Vinix uses mlibc's Linux-compatible termios ABI.
++module termios
++
++#include <termios.h>
++#include <sys/ioctl.h>
++
++const cclen = 32
++
++type TcFlag = int
++type Speed = int
++type Cc = u8
++
++// Termios stores the terminal options on Vinix.
++pub struct C.termios {
++mut:
++	c_iflag  TcFlag
++	c_oflag  TcFlag
++	c_cflag  TcFlag
++	c_lflag  TcFlag
++	c_line   Cc
++	c_cc     [cclen]Cc
++	c_ispeed Speed
++	c_ospeed Speed
++}
++
++fn C.tcgetattr(fd int, termios_p &C.termios) int
++
++fn C.tcsetattr(fd int, optional_actions int, const_termios_p &C.termios) int
++
++fn C.ioctl(fd int, request u64, args ...voidptr) int
++
++// flag provides a termios flag of the correct size.
++@[inline]
++pub fn flag(value int) TcFlag {
++	return TcFlag(value)
++}
++
++@[inline]
++pub fn invert(value TcFlag) TcFlag {
++	return ~int(value)
++}
++
++pub struct Termios {
++pub mut:
++	c_iflag  TcFlag
++	c_oflag  TcFlag
++	c_cflag  TcFlag
++	c_lflag  TcFlag
++	c_line   Cc
++	c_cc     [cclen]Cc
++	c_ispeed Speed
++	c_ospeed Speed
++}
++
++@[inline]
++pub fn tcgetattr(fd int, mut termios_p Termios) int {
++	unsafe {
++		return C.tcgetattr(fd, &C.termios(termios_p))
++	}
++}
++
++@[inline]
++pub fn tcsetattr(fd int, optional_actions int, mut termios_p Termios) int {
++	unsafe {
++		return C.tcsetattr(fd, optional_actions, &C.termios(termios_p))
++	}
++}
++
++@[inline]
++pub fn ioctl(fd int, request u64, arg voidptr) int {
++	unsafe {
++		return C.ioctl(fd, request, arg)
++	}
++}
++
++pub fn set_state(fd int, new_state Termios) int {
++	mut x := new_state
++	return tcsetattr(fd, C.TCSANOW, mut x)
++}
++
++pub fn (mut t Termios) disable_echo() {
++	t.c_lflag &= invert(C.ECHO)
++}
+diff -urN --no-dereference v-clean/vlib/v/pref/should_compile.v v-workdir/vlib/v/pref/should_compile.v
+--- v-clean/vlib/v/pref/should_compile.v
++++ v-workdir/vlib/v/pref/should_compile.v
+@@ -123,6 +123,8 @@
+ 	res := file.replace_each([
+ 		'default.c.v',
+ 		'_',
++		'vinix.c.v',
++		'_',
+ 		'nix.c.v',
+ 		'_',
+ 		'windows.c.v',
