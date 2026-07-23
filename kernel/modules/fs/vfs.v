@@ -856,12 +856,17 @@ pub fn syscall_readlinkat(_ voidptr, dirfd int, _path charptr, buf voidptr, limi
 		return errno.err, errno.einval
 	}
 
-	mut to_copy := u64(node.symlink_target.len + 1)
+	// readlink(2) returns the link contents without a terminating null byte.
+	// Callers use the returned length to terminate or otherwise bound the
+	// result themselves.
+	mut to_copy := u64(node.symlink_target.len)
 	if to_copy > limit {
 		to_copy = limit
 	}
 
-	unsafe { C.memcpy(buf, node.symlink_target.str, to_copy) }
+	if to_copy != 0 {
+		unsafe { C.memcpy(buf, node.symlink_target.str, to_copy) }
+	}
 
 	return to_copy, 0
 }
